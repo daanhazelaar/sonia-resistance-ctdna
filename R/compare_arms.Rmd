@@ -1,0 +1,486 @@
+---
+title: "Compare arms"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r colors-labels}
+arm_colors <- c("arm_A" = "#4E79A7", "arm_B" = "#F28E2B")
+arm_labels  <- c("arm_A" = "Combination (AI + CDK4/6i)", "arm_B" = "Monotherapy (AI)")
+
+mutation_label <- c(
+    "acquired"             = "Aquired",
+    "acquired_polyclonal"  = "Aquired multiple",
+    "acquired_maintained"  = "Aquired & maintained",
+    "maintained"           = "Maintained",
+    "maintained_polyclonal" = "Maintained multiple"
+)
+
+mutation_label_colors <- c(
+    "acquired"             = "#D16A6B",
+    "acquired_polyclonal"  = "#A05555",
+    "acquired_maintained"  = "#F5CDD1",
+    "maintained"           = "#3A7350",
+    "maintained_polyclonal" = "#B0BA93"
+)
+
+focal_copy_number_labels <- c(
+    "acquired_gain" = "Acquired gain",
+    "stable_gain"   = "Stable gain",
+    "acquired_loss" = "Aquired loss",
+    "stable_loss"   = "Stable loss"
+)
+
+focal_copy_number_colors <- c(
+    "acquired_gain" = "#D08159",
+    "stable_gain"   = "#F2A97F",
+    "acquired_loss" = "#8E6BAF",
+    "stable_loss"   = "#C7AEDB"
+)
+```
+
+## Somatic mutation burden
+
+Test mutation burden between arms at progression:
+```{r mutation-burden}
+somatic_mutation_burden <- somatic_tso500_PD_trace_variants_paired |>
+    group_by(patnr, arm) |>
+    summarize(n_somatic_mutations = n(), .groups = "drop")
+
+wilcox.test(n_somatic_mutations ~ arm, data = somatic_mutation_burden)
+```
+
+Per-gene Fisher tests between arms (PD variants):
+```{r per-gene-tests}
+per_gene_tests |>
+    mutate(total_mut = n_mut_A + n_mut_B) |>
+    filter(total_mut > 4) |>
+    pull(genename)
+
+per_gene_tests |> arrange(desc(n_mut_B))
+```
+
+Wilcoxon tests per top gene:
+```{r top-gene-wilcoxon}
+n_top_mut_compare <- bind_rows(lapply(top_genes, function(top_gene) {
+    meta_pd <- meta_data |> filter(timepoint == "PD")
+    mutation_count_patients <- somatic_tso500_PD_trace_variants_paired |>
+        filter(genename == {{ top_gene }}) |>
+        group_by(patnr, arm) |>
+        summarize(n = n(), .groups = "drop") |>
+        right_join(meta_pd, by = join_by(patnr, arm)) |>
+        mutate(n = ifelse(is.na(n), 0, n))
+    mutation_count_patients_armA <- mutation_count_patients |> filter(arm == "arm_A")
+    mutation_count_patients_armB <- mutation_count_patients |> filter(arm == "arm_B")
+    test_res <- wilcox.test(mutation_count_patients_armA$n, mutation_count_patients_armB$n)
+    tibble(
+        genename       = top_gene,
+        p_value        = test_res$p.value,
+        median_mut_armA = mean(mutation_count_patients_armA$n),
+        median_mut_armB = mean(mutation_count_patients_armB$n)
+    )
+}))
+
+n_top_mut_compare |> mutate(p_adj = p.adjust(p_value, method = "fdr"))
+```
+
+Fisher test for RB1 (hardcoded from manual curation):
+```{r rb1-fisher}
+mat <- matrix(c(7, 0, 14, 21), nrow = 2,
+              dimnames = list(Arm = c("Combination", "Monotherapy"),
+                              RB1 = c("Event", "No event")))
+fisher.test(mat)
+```
+
+## Oncoplot — tornado chart
+
+```{r oncoplot-tornado}
+n_mutations_per_patient <- somatic_tso500_PD_trace_variants_paired |>
+    right_join(top_genes_alteration, by = join_by(genename)) |>
+    left_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    left_join(mutation_labels, by = join_by(patnr, genename, arm)) |>
+    group_by(patnr, arm, genename, gene_order, total_mut, mutation_label) |>
+    summarize(n = n(), .groups = "drop") |>
+    mutate(perc = n / total_mut)
+
+percentage_labels <- n_mutations_per_patient |>
+    group_by(arm, genename, gene_order) |>
+    summarize(n_mutations_per_arm = length(unique(patnr)), .groups = "drop") |>
+    mutate(
+        perc_mutations_per_arm = round(ifelse(arm == "arm_A", n_mutations_per_arm / 21, -n_mutations_per_arm / 14) * 100),
+        perc_label = paste0(abs(perc_mutations_per_arm), "%"),
+        x = ifelse(arm == "arm_A", perc_mutations_per_arm + 11, perc_mutations_per_arm - 11)
+    )
+
+n_mutations_per_patient |>
+    group_by(arm, genename, gene_order, mutation_label) |>
+    summarize(n_mutations_per_arm = length(unique(patnr)), .groups = "drop") |>
+    mutate(perc = round(ifelse(arm == "arm_A", n_mutations_per_arm / 21, -n_mutations_per_arm / 14) * 100)) |>
+    ggplot() +
+    geom_bar(aes(y = reorder(genename, gene_order, decreasing = TRUE), x = perc, fill = mutation_label),
+             stat = "identity") +
+    coord_cartesian(xlim = c(-100, 100)) +
+    scale_x_continuous(breaks = c(-100, -50, 0, 50, 100),
+                       labels = c("100%", "50%", "0%", "50%", "100%")) +
+    scale_fill_manual(labels = mutation_label, values = mutation_label_colors) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 0.3) +
+    geom_text(data = percentage_labels,
+              aes(x = x, y = reorder(genename, gene_order, decreasing = FALSE), label = perc_label)) +
+    labs(title = "", x = "% Patients", y = "Genes", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'none',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_arms_oncoplot_tornado.pdf", plot = last_plot(), width = 7, height = 6)
+```
+
+## Oncoplot — tile plot per patient
+
+```{r oncoplot-tiles}
+n_mutations_per_patient_at_PD <- somatic_tso500_PD_trace_variants_paired |>
+    right_join(top_genes_alteration, by = join_by(genename)) |>
+    left_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    left_join(mutation_labels, by = join_by(patnr, genename, arm)) |>
+    group_by(patnr, arm, genename, diff_variant) |>
+    summarize(n_mututation_at_PD = n(), .groups = "drop") |>
+    mutate(n_mututation_at_PD = ifelse(diff_variant == "both", ceiling(n_mututation_at_PD / 2), n_mututation_at_PD)) |>
+    group_by(patnr, arm, genename) |>
+    summarize(n_mututation_at_PD = sum(n_mututation_at_PD), .groups = "drop")
+
+somatic_tso500_PD_trace_variants_paired |>
+    right_join(top_genes_alteration, by = join_by(genename)) |>
+    left_join(mutation_labels, by = join_by(patnr, genename, arm)) |>
+    bind_rows(missing_patients) |>
+    tidyr::complete(tidyr::nesting(patnr, arm), tidyr::nesting(genename, gene_order)) |>
+    filter(!is.na(genename)) |>
+    left_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    left_join(n_mutations_per_patient_at_PD, by = join_by(patnr, arm, genename)) |>
+    mutate(arm = factor(arm, levels = c("arm_B", "arm_A"))) |>
+    ggplot(aes(
+        x = reorder(patnr, patient_ordering, decreasing = TRUE),
+        y = reorder(genename, gene_order, decreasing = TRUE))
+    ) +
+    ggplot2::geom_tile(aes(fill = as.factor(mutation_label)), color = "gray", linewidth = 0.1) +
+    geom_text(aes(label = round(n_mututation_at_PD, 2)), color = "white", size = 2.5, na.rm = TRUE) +
+    scale_fill_manual(labels = mutation_label, values = mutation_label_colors,
+                      na.value = "white", na.translate = TRUE) +
+    facet_grid(~arm, scales = "free", space = "free", labeller = labeller(arm = arm_labels)) +
+    labs(title = "Maintained and acquired mutations", x = "Patient ID", y = "Genes", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_arms_oncoplot_tiles.pdf", plot = last_plot(), width = 11, height = 6)
+```
+
+## Focal copy number
+
+Correlation between focal (TSO500) and chromosomal (ichorCNA) copy number:
+```{r cn-correlation}
+copy_number_genes |>
+    ggplot(aes(x = cn_tumor_gene_int, y = ichorCNA_cn)) +
+    geom_jitter(width = 0.5, height = 0.5, alpha = 0.5) +
+    geom_vline(xintercept = 1) +
+    geom_hline(yintercept = 1) +
+    geom_abline(slope = 1, intercept = 0) +
+    ggpubr::stat_cor(p.accuracy = 0.001, method = "spearman", size = 4, cor.coef.name = "rho") +
+    labs(
+        title = "Focal and chromosomal copy number of copy number altered genes",
+        y = "Focal copy number",
+        x = "Chromosomal copy number"
+    ) +
+    theme_light() +
+    theme(
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        legend.position  = "bottom",
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/compare_arms_copy_number_correlation.pdf", plot = last_plot(), width = 6, height = 5)
+
+```
+
+Per-gene Fisher tests for focal copy number alterations between arms:
+```{r cn-fisher-tests}
+per_gene_copy_number_test <- copy_number_genes_wide |>
+    filter(diff_variant_focal_cna != "BL") |>
+    select(patnr, arm, genename) |>
+    distinct() |>
+    select(!patnr) |>
+    group_by(arm, genename) |>
+    summarize(n = n(), .groups = "drop") |>
+    tidyr::pivot_wider(names_from = arm, values_from = n, values_fill = 0) |>
+    group_by(genename) |>
+    group_modify(~fisher_gene(.x)) |>
+    ungroup() |>
+    arrange(p_value)
+
+top_genes_copy_number <- per_gene_copy_number_test |>
+    mutate(total_cn_alteration = n_mut_A + n_mut_B) |>
+    right_join(gene_ordering_focal_cna, by = join_by(genename)) |>
+    arrange(gene_ordering, genename) |>
+    mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+top_genes_copy_number |>
+    arrange(p_value) |>
+    mutate(p_adj = p.adjust(p_value, method = "BH")) |>
+    arrange(gene_ordering, genename)
+```
+
+Focal CNA oncoplot — tile per patient:
+```{r cn-oncoplot}
+patients_with_mut_in_top_focal_cn <- copy_number_genes_wide |>
+    filter(diff_variant_focal_cna != "BL") |>
+    right_join(top_genes_copy_number, by = join_by(genename)) |>
+    pull(patnr) |>
+    unique()
+
+missing_patients_focal_cn <- meta_data |>
+    filter(!patnr %in% patients_with_mut_in_top_focal_cn, timepoint == "PD")
+
+# Patient ordering based on CN alteration burden (descending total events)
+cn_patient_ordering <- copy_number_genes_wide |>
+    filter(diff_variant_focal_cna != "BL") |>
+    right_join(top_genes_copy_number |> select(genename, gene_ordering), by = join_by(genename)) |>
+    select(patnr, arm, genename) |>
+    distinct() |>
+    mutate(has_cn = 1L) |>
+    tidyr::pivot_wider(names_from = genename, values_from = has_cn, values_fill = 0L) |>
+    right_join(meta_data |> filter(timepoint == "PD") |> select(patnr, arm), by = join_by(patnr, arm)) |>
+    mutate(across(any_of(top_genes_copy_number$genename), ~ifelse(is.na(.), 0L, .))) |>
+    mutate(n_cn_total = rowSums(across(any_of(top_genes_copy_number$genename)), na.rm = TRUE)) |>
+    arrange(desc(n_cn_total), across(rev(any_of(top_genes_copy_number$genename)), ~ desc(.x))) |>
+    mutate(cn_patient_ordering = row_number()) |>
+    select(patnr, arm, cn_patient_ordering)
+
+# Full grid: all PD patients × all top CN genes — ensures patients with no
+# events appear as empty columns rather than being silently dropped
+full_cn_grid <- tidyr::crossing(
+    meta_data |> filter(timepoint == "PD") |> select(patnr, arm),
+    top_genes_copy_number |> select(genename, gene_ordering)
+)
+
+focal_cn_oncoplot <- copy_number_genes_wide |>
+    filter(diff_variant_focal_cna != "BL") |>
+    right_join(top_genes_copy_number, by = join_by(genename)) |>
+    right_join(full_cn_grid, by = join_by(patnr, arm, genename, gene_ordering)) |>
+    left_join(cn_patient_ordering, by = join_by(patnr, arm)) |>
+    mutate(arm = factor(arm, levels = c("arm_B", "arm_A"))) |>
+    ggplot2::ggplot(aes(
+        x = reorder(patnr, cn_patient_ordering, decreasing = FALSE),
+        y = reorder(genename, gene_ordering, decreasing = FALSE))
+    ) +
+    ggplot2::geom_tile(aes(fill = as.factor(cn_category)), na.rm = TRUE, color = "black", linewidth = 0.1) +
+    geom_text(aes(label = round(cn_PD, 2)), color = "white", size = 2.5, na.rm = TRUE) +
+    scale_fill_manual(values = focal_copy_number_colors, na.value = "white",
+                      labels = focal_copy_number_labels, na.translate = TRUE) +
+    facet_grid(~arm, scales = "free", space = "free", labeller = labeller(arm = arm_labels)) +
+    labs(title = "Retained and acquired focal copy number alterations",
+         x = "Patient ID", y = "Genes", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    ) +
+    guides(fill = guide_legend(nrow = 1, byrow = FALSE))
+
+focal_cn_oncoplot
+ggsave("results/figures/compare_arms_focal_cn_oncoplot.pdf", plot = focal_cn_oncoplot, width = 11, height = 6)
+
+```
+
+Tornado chart of focal CNA frequencies between arms:
+```{r cn-tornado}
+percentage_labels_focal_cn <- copy_number_genes_wide |>
+    filter(diff_variant_focal_cna != "BL") |>
+    right_join(top_genes_copy_number, by = join_by(genename)) |>
+    right_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    select(patnr, arm, genename, cn_category, total_cn_alteration, gene_ordering) |>
+    distinct() |>
+    group_by(genename, arm, total_cn_alteration, cn_category, gene_ordering) |>
+    summarize(n = n(), .groups = "drop") |>
+    mutate(perc = ifelse(arm == "arm_A", n / 21, -n / 14)) |>
+    group_by(genename, arm, gene_ordering) |>
+    summarize(perc_total = round(sum(perc) * 100), .groups = "drop") |>
+    mutate(
+        perc_label = paste0(abs(perc_total), "%"),
+        x = ifelse(arm == "arm_A", perc_total / 100 + 0.16, perc_total / 100 - 0.16)
+    ) |>
+    filter(!is.na(genename))
+
+focal_cn_frequency <- copy_number_genes_wide |>
+    filter(diff_variant_focal_cna != "BL") |>
+    right_join(top_genes_copy_number, by = join_by(genename)) |>
+    right_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    select(patnr, arm, genename, cn_category, total_cn_alteration, gene_ordering) |>
+    distinct() |>
+    group_by(genename, arm, total_cn_alteration, cn_category, gene_ordering) |>
+    summarize(n = n(), .groups = "drop") |>
+    mutate(perc = ifelse(arm == "arm_A", n / 21, -n / 14)) |>
+    filter(!is.na(genename)) |>
+    ggplot() +
+    geom_bar(aes(
+        y    = reorder(genename, gene_ordering, decreasing = FALSE),
+        x    = perc,
+        fill = factor(cn_category, levels = c("acquired_gain", "stable_gain", "acquired_loss", "stable_loss"))
+    ), stat = "identity") +
+    coord_cartesian(xlim = c(-1, 1)) +
+    scale_x_continuous(breaks = c(-1, -0.5, 0, 0.5, 1),
+                       labels = c("100%", "50%", "0%", "50%", "100%")) +
+    scale_fill_manual(values = focal_copy_number_colors, na.value = "grey80",
+                      labels = focal_copy_number_labels) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 0.3) +
+    geom_text(data = percentage_labels_focal_cn,
+              aes(x = x, y = reorder(genename, gene_ordering, decreasing = FALSE), label = perc_label), size = 3) +
+    labs(title = "Frequency of focal copy number alterations",
+         x = "% Patients", y = "Genes", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 8, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 8),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    ) +
+    guides(fill = guide_legend(nrow = 1, byrow = FALSE))
+
+focal_cn_frequency
+ggsave("results/figures/compare_arms_focal_cn_tornado.pdf", plot = focal_cn_frequency, width = 7, height = 6)
+```
+
+
+## Combined oncoplot: tiles + tornado
+
+```{r oncoplot-combined, fig.width=9, fig.height=5}
+oncoplot_tile <- somatic_tso500_PD_trace_variants_paired |>
+    right_join(top_genes_alteration, by = join_by(genename)) |>
+    left_join(mutation_labels, by = join_by(patnr, genename, arm)) |>
+    bind_rows(missing_patients) |>
+    tidyr::complete(tidyr::nesting(patnr, arm), tidyr::nesting(genename, gene_order)) |>
+    filter(!is.na(genename)) |>
+    left_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    left_join(n_mutations_per_patient_at_PD, by = join_by(patnr, arm, genename)) |>
+    mutate(arm = factor(arm, levels = c("arm_B", "arm_A"))) |>
+    ggplot(aes(
+        x = reorder(patnr, patient_ordering, decreasing = TRUE),
+        y = reorder(genename, gene_order, decreasing = TRUE))
+    ) +
+    ggplot2::geom_tile(aes(fill = as.factor(mutation_label)), color = "gray", linewidth = 0.1) +
+    geom_text(aes(label = round(n_mututation_at_PD, 2)), color = "white", size = 2.5, na.rm = TRUE) +
+    scale_fill_manual(labels = mutation_label, values = mutation_label_colors,
+                      na.value = "white", na.translate = TRUE) +
+    facet_grid(~arm, scales = "free", space = "free", labeller = labeller(arm = arm_labels)) +
+    labs(title = "Maintained and acquired mutations", x = "Patient ID", y = "Genes", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = ggplot2::element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+
+frequency_bar <- n_mutations_per_patient |>
+    group_by(arm, genename, gene_order, mutation_label) |>
+    summarize(n_mutations_per_arm = length(unique(patnr)), .groups = "drop") |>
+    mutate(perc = round(ifelse(arm == "arm_A", n_mutations_per_arm / 21, -n_mutations_per_arm / 14) * 100)) |>
+    ggplot() +
+    geom_bar(aes(y = reorder(genename, gene_order, decreasing = TRUE), x = perc, fill = mutation_label),
+             stat = "identity") +
+    coord_cartesian(xlim = c(-100, 100)) +
+    scale_x_continuous(breaks = c(-100, -50, 0, 50, 100),
+                       labels = c("100%", "50%", "0%", "50%", "100%")) +
+    scale_fill_manual(labels = mutation_label, values = mutation_label_colors) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 0.3) +
+    geom_text(data = percentage_labels,
+              aes(x = x, y = reorder(genename, gene_order, decreasing = FALSE), label = perc_label),
+              size = 2) +
+    labs(x = "% Patients", y = "", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = "none",
+        text             = ggplot2::element_text(size = 7, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.text.y      = element_blank(),
+        axis.title.y     = element_blank(),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+
+combined_oncoplot <- patchwork::wrap_plots(oncoplot_tile, frequency_bar, design = "AAAAAAAAAABBB#")
+combined_oncoplot
+ggsave("results/figures/compare_arms_oncoplot_combined.pdf", plot = combined_oncoplot, width = 9, height = 5)
+```
+
+
+## Combined focal CN oncoplot: tiles + tornado
+
+```{r focal-cn-combined, fig.width=9, fig.height=5}
+combined_focal_cn_oncoplot <- patchwork::wrap_plots(
+    focal_cn_oncoplot,
+    focal_cn_frequency +
+        labs(title = "", y = "") +
+        ggplot2::theme(
+            legend.position = "none",
+            axis.text.y     = element_blank(),
+            axis.title.y    = element_blank()
+        ),
+    design = "AAAAAAAAAABBB#"
+)
+combined_focal_cn_oncoplot
+ggsave("results/figures/compare_arms_focal_cn_combined.pdf",
+       plot = combined_focal_cn_oncoplot, width = 9, height = 5)
+```
+
+
+```{r}
+
+```
+

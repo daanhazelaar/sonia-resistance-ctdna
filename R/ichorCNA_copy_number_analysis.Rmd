@@ -1,0 +1,455 @@
+---
+title: "Chromosomal copy number analysis (ichorCNA sWGS)"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r colors-labels}
+arm_colors <- c("arm_A" = "#4E79A7", "arm_B" = "#F28E2B")
+arm_labels  <- c("arm_A" = "Combination (AI + CDK4/6i)", "arm_B" = "Monotherapy (AI)")
+
+timepoint_colors           <- c("BL" = "#A6C8E0", "PD" = "#4E79A7")
+timepoint_labels           <- c("BL" = "Baseline",  "PD" = "Progression")
+timepoint_both_arms_colors <- c("arm_A_BL" = "#A6C8E0", "arm_A_PD" = "#4E79A7",
+                                "arm_B_BL" = "#F8C99B", "arm_B_PD" = "#F28E2B")
+timepoint_both_arms_labels <- c("arm_A_BL" = "Baseline (combination treatment)",
+                                "arm_A_PD" = "Progression (combination treatment)",
+                                "arm_B_BL" = "Baseline (monotherapy)",
+                                "arm_B_PD" = "Progression (monotherapy)")
+cnCall_colors <- c("GAIN" = "#F46D43", "LOSS" = "#6BAED6")
+
+chr_order <- paste0("chr", c(1:22, "X", "Y"))
+```
+
+## Tumor fraction estimates
+
+```{r tumor-fraction}
+estimatesIchorCNA_sonia |>
+    distinct(patnr, arm, timepoint, sampleName_shWGS, tumorFractionEstimate) |>
+    ggplot(aes(x = timepoint, y = tumorFractionEstimate, fill = timepoint)) +
+    geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+    geom_line(aes(group = patnr), alpha = 0.3, linewidth = 0.4) +
+    geom_point(size = 1.8, alpha = 0.7) +
+    facet_wrap(~arm, labeller = labeller(arm = arm_labels)) +
+    scale_fill_manual(values = timepoint_colors, labels = timepoint_labels) +
+    scale_x_discrete(labels = timepoint_labels) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+        title = "Tumor fraction estimates at baseline and progression",
+        subtitle = "Lines connect paired baseline-progression samples",
+        x     = NULL,
+        y     = "Tumor fraction (ichorCNA)",
+        fill  = "Timepoint"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/ichorCNA_tumor_fraction.pdf", plot = last_plot(), width = 7, height = 4.5)
+```
+
+## Aggregated chromosomal copy number profiles
+
+```{r cn-frequency-prep}
+samples_per_group <- estimatesIchorCNA_sonia |>
+    distinct(patnr, arm, timepoint) |>
+    group_by(arm, timepoint) |>
+    summarise(n_samples = n(), .groups = "drop")
+
+cn_calls_binned <- estimatesIchorCNA_sonia |>
+    mutate(
+        cn_call = case_when(
+            Corrected_Call %in% c("GAIN", "AMP", "HLAMP", "HLAMP2") ~ "GAIN",
+            Corrected_Call == "HETD"                                 ~ "LOSS",
+            .default = NA
+        )
+    ) |>
+    filter(!is.na(cn_call)) |>
+    group_by(seqnames, start, bins, cn_call, arm, timepoint) |>
+    summarise(count = n(), .groups = "drop") |>
+    left_join(samples_per_group, by = join_by(arm, timepoint)) |>
+    mutate(freq = count / n_samples)
+
+bin_order <- estimatesIchorCNA_sonia |>
+    distinct(seqnames, start, bins) |>
+    mutate(seqnames = factor(seqnames, levels = chr_order)) |>
+    arrange(seqnames, start) |>
+    tibble::rowid_to_column("bin_id")
+```
+
+```{r cn-frequency-plot, fig.width=14, fig.height=8}
+chr_bounds <- bin_order |>
+    group_by(seqnames) |>
+    summarise(chr_start = min(bin_id), chr_end = max(bin_id), .groups = "drop") |>
+    mutate(
+        chr_mid   = (chr_start + chr_end) / 2,
+        chr_label = gsub("chr", "", seqnames),
+        chr_idx   = row_number(),
+        is_even   = chr_idx %% 2 == 0
+    )
+
+chr_shading <- chr_bounds |>
+    filter(is_even) |>
+    select(xmin = chr_start, xmax = chr_end)
+
+cn_calls_binned |>
+    right_join(bin_order, by = join_by(seqnames, start, bins)) |>
+    tidyr::replace_na(list(freq = 0)) |>
+    mutate(
+        freq = ifelse(cn_call == "LOSS", -freq, freq),
+        cn_call = tidyr::replace_na(cn_call, "GAIN"),
+        facet_label = paste0(
+            ifelse(arm == "arm_A", "Combination", "Monotherapy"), " – ",
+            ifelse(timepoint == "BL", "Baseline", "Progression")
+        )
+    ) |>
+    filter(!is.na(arm), !is.na(timepoint)) |>
+    ggplot(aes(x = bin_id, y = freq, fill = cn_call)) +
+    geom_rect(
+        data        = chr_shading,
+        aes(xmin = xmin - 0.5, xmax = xmax + 0.5, ymin = -Inf, ymax = Inf),
+        inherit.aes = FALSE, fill = "grey92", alpha = 0.5
+    ) +
+    geom_hline(yintercept = 0, linewidth = 0.3, color = "grey40") +
+    geom_col(width = 1) +
+    facet_wrap(~facet_label, ncol = 1) +
+    scale_fill_manual(values = cnCall_colors, labels = c("GAIN" = "Gain", "LOSS" = "Loss")) +
+    scale_x_continuous(
+        breaks = chr_bounds$chr_mid,
+        labels = chr_bounds$chr_label,
+        expand = c(0.005, 0)
+    ) +
+    scale_y_continuous(
+        breaks = seq(-1, 1, 0.25),
+        labels = function(x) paste0(abs(x) * 100, "%"),
+        expand = c(0, 0)
+    ) +
+    coord_cartesian(ylim = c(-1, 1)) +
+    labs(
+        title = "Aggregated chromosomal copy number profiles at baseline and progression",
+        x     = "Chromosome",
+        y     = "Frequency",
+        fill  = NULL
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/ichorCNA_cn_frequency_genome.pdf", plot = last_plot(), width = 14, height = 8)
+```
+
+## Genome fraction affected by chromosomal CNAs
+
+```{r genome-affected-prep}
+genome_affected <- estimatesIchorCNA_sonia |>
+    group_by(patnr, arm, timepoint, Corrected_Call) |>
+    summarize(n_bins = n(), .groups = "drop") |>
+    group_by(patnr, arm, timepoint) |>
+    mutate(total_bins = sum(n_bins)) |>
+    ungroup() |>
+    filter(Corrected_Call == "NEUT") |>
+    mutate(perc_affected = 1 - n_bins / total_bins)
+```
+
+```{r genome-affected-stats}
+genome_affected |>
+    group_by(arm, timepoint) |>
+    summarize(
+        mean_pct   = mean(perc_affected),
+        median_pct = median(perc_affected),
+        min_pct    = min(perc_affected),
+        max_pct    = max(perc_affected),
+        .groups    = "drop"
+    )
+
+genome_affected_wide <- genome_affected |>
+    tidyr::pivot_wider(names_from = timepoint, values_from = c(perc_affected, n_bins, total_bins))
+
+cat("Arm A — Wilcoxon BL vs PD (% genome affected):\n")
+wilcox.test(
+    genome_affected_wide$perc_affected_BL[genome_affected_wide$arm == "arm_A"],
+    genome_affected_wide$perc_affected_PD[genome_affected_wide$arm == "arm_A"]
+)
+
+cat("Arm B — Wilcoxon BL vs PD (% genome affected):\n")
+wilcox.test(
+    genome_affected_wide$perc_affected_BL[genome_affected_wide$arm == "arm_B"],
+    genome_affected_wide$perc_affected_PD[genome_affected_wide$arm == "arm_B"]
+)
+```
+
+```{r genome-affected-boxplot, fig.width=7, fig.height=4.5}
+genome_affected |>
+    ggplot(aes(x = timepoint, y = perc_affected, fill = timepoint)) +
+    geom_boxplot(width = 0.5, outlier.shape = NA, alpha = 0.7) +
+    geom_line(aes(group = patnr), alpha = 0.3, linewidth = 0.4) +
+    geom_point(size = 1.8, alpha = 0.7) +
+    facet_wrap(~arm, labeller = labeller(arm = arm_labels)) +
+    scale_fill_manual(values = timepoint_colors, labels = timepoint_labels) +
+    scale_x_discrete(labels = timepoint_labels) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    labs(
+        title    = "Percentage of genome affected by chromosomal CNAs",
+        subtitle = "Lines connect paired baseline-progression samples",
+        x        = NULL,
+        y        = "Genome affected",
+        fill     = "Timepoint"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/ichorCNA_genome_affected_boxplot.pdf", plot = last_plot(), width = 7, height = 4.5)
+```
+
+```{r genome-affected-per-patient, fig.width=9, fig.height=5}
+genome_affected |>
+    mutate(timepoint_arm = paste0(arm, "_", timepoint)) |>
+    ggplot(aes(x = patnr, y = perc_affected, fill = timepoint_arm)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = timepoint_both_arms_colors, labels = timepoint_both_arms_labels) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    facet_grid(~arm, scales = "free", space = "free", labeller = labeller(arm = arm_labels)) +
+    labs(
+        title = "Genome affected by chromosomal copy number alterations per patient",
+        x     = "Patient ID",
+        y     = "Genome affected",
+        fill  = NULL
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/ichorCNA_genome_affected_per_patient.pdf", plot = last_plot(), width = 9, height = 5)
+```
+
+```{r genome-affected-scatter, fig.width=7, fig.height=4}
+genome_affected_wide |>
+    ggplot(aes(x = perc_affected_BL, y = perc_affected_PD, color = arm)) +
+    geom_point(size = 2) +
+    geom_abline(slope = 1, intercept = 0, color = "grey50", linetype = "dashed") +
+    facet_grid(~arm, labeller = labeller(arm = arm_labels)) +
+    scale_color_manual(values = arm_colors) +
+    scale_x_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(
+        title = "Genome affected: baseline vs progression",
+        x     = "Baseline",
+        y     = "Progression",
+        color = "Treatment arm"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "none",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/ichorCNA_genome_affected_scatter.pdf", plot = last_plot(), width = 7, height = 4)
+```
+
+## Chromosomal CNA oncoplot at progression
+
+```{r chromosomal-cna-colors}
+chromosomal_copy_number_colors <- c(
+    "acquired_gain"      = "#D08159",
+    "stable_gain"        = "#F2A97F",
+    "acquired_loss"      = "#8E6BAF",
+    "stable_loss"        = "#C7AEDB",
+    "loss_of_alteration" = "#D3D3D3"
+)
+chromosomal_copy_number_labels <- c(
+    "stable_loss"        = "Stable loss",
+    "acquired_loss"      = "Acquired loss",
+    "stable_gain"        = "Stable gain",
+    "acquired_gain"      = "Acquired gain",
+    "loss_of_alteration" = "Loss of alteration"
+)
+chromosome_ordering <- tibble::tibble(
+    chromosome_ordering = 1:24,
+    seqnames            = paste0("chr", c(1:22, "X", "Y"))
+)
+```
+
+```{r chromosomal-cna-prep}
+chromosomal_cn_annotation <- estimatesIchorCNA_sonia |>
+    filter(timepoint == "PD", !is.na(Corrected_Call)) |>
+    mutate(
+        Corrected_Call = ifelse(
+            Corrected_Call %in% c("HLAMP", "HLAMP2", "HLAMP3"), "AMP", Corrected_Call
+        )
+    ) |>
+    group_by(patnr, arm, timepoint, sampleName_shWGS, seqnames) |>
+    summarize(median_cn = median(Corrected_Copy_Number), n = n(), .groups = "drop") |>
+    mutate(median_cn = ifelse(patnr == "145" & seqnames == "chr1", 3, median_cn)) |>
+    left_join(emerged_chromosomal_cnas, by = join_by(patnr, arm, seqnames)) |>
+    mutate(chr_call = case_when(
+        median_cn == 1 & is.na(cna_type)    ~ "stable_loss",
+        median_cn == 2 & is.na(cna_type)    ~ "neutral",
+        median_cn >= 3 & is.na(cna_type)    ~ "stable_gain",
+        median_cn == 1 & cna_type == "loss" ~ "acquired_loss",
+        median_cn >= 3 & cna_type == "gain" ~ "acquired_gain",
+        median_cn == 2 & return_to_diploid  ~ "loss_of_alteration"
+    )) |>
+    filter(chr_call != "neutral")
+
+patient_order_chromosomal_cna <- chromosomal_cn_annotation |>
+    group_by(patnr) |>
+    summarize(n_chromosomal_cna = n(), .groups = "drop") |>
+    arrange(n_chromosomal_cna) |>
+    tibble::rowid_to_column(var = "patient_ordering") |>
+    left_join(meta_data, by = join_by(patnr)) |>
+    select(patnr, arm, patient_ordering) |>
+    distinct()
+```
+
+```{r chromosomal-cna-oncoplot}
+chromosomal_copy_number_oncoplot <- chromosomal_cn_annotation |>
+    left_join(patient_order_chromosomal_cna, by = join_by(patnr, arm)) |>
+    left_join(chromosome_ordering, by = join_by(seqnames)) |>
+    mutate(arm = factor(arm, levels = c("arm_B", "arm_A"))) |>
+    ggplot(aes(
+        x = reorder(patnr, patient_ordering, decreasing = TRUE),
+        y = reorder(seqnames, chromosome_ordering, decreasing = TRUE)
+    )) +
+    geom_tile(aes(fill = as.factor(chr_call)), na.rm = TRUE, color = "black", linewidth = 0.1) +
+    geom_text(aes(label = round(median_cn, 2)), color = "white", size = 2.5, na.rm = TRUE) +
+    scale_fill_manual(
+        values       = chromosomal_copy_number_colors,
+        labels       = chromosomal_copy_number_labels,
+        na.translate = TRUE
+    ) +
+    facet_grid(~arm, scales = "free", space = "free", labeller = labeller(arm = arm_labels)) +
+    labs(
+        title = "Retained and acquired chromosomal copy number alterations at progression",
+        x     = "Patient ID",
+        y     = "Chromosomes",
+        fill  = "Alterations"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    ) +
+    guides(fill = guide_legend(nrow = 1, byrow = FALSE))
+
+chromosomal_copy_number_oncoplot
+ggsave("results/figures/ichorCNA_chromosomal_cna_oncoplot.pdf", plot = chromosomal_copy_number_oncoplot, width = 9, height = 6)
+```
+
+```{r chromosomal-cna-frequency}
+percentage_labels_chromosomal_cn <- chromosomal_cn_annotation |>
+    left_join(chromosome_ordering, by = join_by(seqnames)) |>
+    group_by(arm, seqnames, chromosome_ordering, chr_call) |>
+    summarize(n_per_arm = length(unique(patnr)), .groups = "drop") |>
+    mutate(perc = round(ifelse(arm == "arm_A", n_per_arm / 20, -n_per_arm / 14) * 100)) |>
+    group_by(seqnames, arm, chromosome_ordering) |>
+    summarize(perc_total = round(sum(perc)), .groups = "drop") |>
+    mutate(
+        perc_label = paste0(abs(perc_total), "%"),
+        x          = ifelse(arm == "arm_A", perc_total + 15, perc_total - 12)
+    )
+
+chromosomal_copy_number_frequency <- chromosomal_cn_annotation |>
+    left_join(chromosome_ordering, by = join_by(seqnames)) |>
+    group_by(arm, seqnames, chromosome_ordering, chr_call) |>
+    summarize(n_per_arm = length(unique(patnr)), .groups = "drop") |>
+    mutate(perc = round(ifelse(arm == "arm_A", n_per_arm / 20, -n_per_arm / 14) * 100)) |>
+    ggplot() +
+    geom_bar(
+        aes(y = reorder(seqnames, chromosome_ordering, decreasing = TRUE), x = perc, fill = chr_call),
+        stat = "identity"
+    ) +
+    coord_cartesian(xlim = c(-100, 100)) +
+    scale_x_continuous(
+        breaks = c(-100, -50, 0, 50, 100),
+        labels = c("100%", "50%", "0%", "50%", "100%")
+    ) +
+    scale_fill_manual(values = chromosomal_copy_number_colors, labels = chromosomal_copy_number_labels) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 0.3) +
+    geom_text(
+        data = percentage_labels_chromosomal_cn,
+        aes(x = x, y = reorder(seqnames, chromosome_ordering, decreasing = FALSE), label = perc_label),
+        size = 3
+    ) +
+    labs(x = "% patients", y = "", fill = "") +
+    theme_light() +
+    theme(
+        legend.position  = "none",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.y      = element_blank(),
+        axis.text.x      = element_text(hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+
+chromosomal_copy_number_frequency
+ggsave("results/figures/ichorCNA_chromosomal_cna_frequency.pdf", plot = chromosomal_copy_number_frequency, width = 4, height = 6)
+```
+
+```{r chromosomal-cna-combined, fig.width=9, fig.height=6}
+chromosomal_copy_number_combined <- patchwork::wrap_plots(
+    chromosomal_copy_number_oncoplot,
+    chromosomal_copy_number_frequency,
+    design = "AAAAAAAAAABBB#"
+)
+chromosomal_copy_number_combined
+ggsave("results/figures/ichorCNA_chromosomal_cna_combined.pdf", plot = chromosomal_copy_number_combined, width = 9, height = 6)
+```
+
+
+```{r}
+
+```
+

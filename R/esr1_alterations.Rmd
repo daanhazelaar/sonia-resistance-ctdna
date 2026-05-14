@@ -1,0 +1,631 @@
+---
+title: "ESR1 alterations"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r colors-labels}
+arm_colors <- c("arm_A" = "#4E79A7", "arm_B" = "#F28E2B")
+arm_labels  <- c("arm_A" = "Combination (AI + CDK4/6i)", "arm_B" = "Monotherapy (AI)")
+
+esr1_mutation_colors <- c(
+    "L536P" = "#66c2a5",
+    "L536H" = "#a6d854",
+    "L536R" = "#8da0cb",
+    "Y537N" = "#e78ac3",
+    "Y537S" = "#fc8d62",
+    "Y537C" = "#ffd92f",
+    "D538G" = "#e5c494"
+)
+```
+
+## ESR1 mutation annotation
+
+```{r translate-hgvs}
+translate_hgvs_to_oneletter <- function(hgvs_vec) {
+    aa_dict <- c(
+        Ala = "A", Arg = "R", Asn = "N", Asp = "D",
+        Cys = "C", Gln = "Q", Glu = "E", Gly = "G",
+        His = "H", Ile = "I", Leu = "L", Lys = "K",
+        Met = "M", Phe = "F", Pro = "P", Ser = "S",
+        Thr = "T", Trp = "W", Tyr = "Y", Val = "V",
+        Ter = "*", Stop = "*", del = "del"
+    )
+
+    hgvs_vec <- stringr::str_remove(hgvs_vec, ".*p\\.")
+    hgvs_vec <- stringr::str_remove_all(hgvs_vec, "^\\(|\\)$")
+
+    unlist(lapply(hgvs_vec, function(hgvs) {
+        if (!is.na(hgvs)) {
+            if (stringr::str_detect(hgvs, "fsTer")) {
+                pattern <- "([A-Za-z]+)([0-9]+)([A-Za-z]+)(fsTer)([0-9]+)"
+                matches <- stringr::str_match(hgvs, pattern)
+                stringr::str_c(aa_dict[matches[, 2]], matches[, 3],
+                               aa_dict[matches[, 4]], "_", matches[, 5], matches[, 6])
+            } else {
+                pattern <- "([A-Za-z]+)([0-9]+)([A-Za-z]+)"
+                matches <- stringr::str_match(hgvs, pattern)
+                stringr::str_c(aa_dict[matches[, 2]], matches[, 3], aa_dict[matches[, 4]])
+            }
+        } else {
+            "splice"
+        }
+    }))
+}
+```
+
+```{r esr1-annotated}
+esr1_annotated <- somatic_tso500_ALL_trace_variants_paired |>
+    left_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    filter(genename == "ESR1", varianttype == "SNV", timepoint == "PD") |>
+    mutate(
+        proteinchange_one_letter = translate_hgvs_to_oneletter(proteinchange),
+        genelabel  = paste0(genename, "_", proteinchange_one_letter),
+        aa_residue = as.numeric(stringr::str_extract(proteinchange_one_letter, "[0-9]{1,3}"))
+    ) |>
+    filter(aa_residue %in% c(536, 537, 538)) |>
+    mutate(ccf = ifelse(is.na(ccf_BL), ccf_PD, ccf_BL))
+```
+
+## ESR1 prevalence
+
+```{r esr1-prevalence}
+n_esr1_arm_A <- esr1_annotated |> filter(arm == "arm_A") |> pull(patnr) |> n_distinct()
+n_esr1_arm_B <- esr1_annotated |> filter(arm == "arm_B") |> pull(patnr) |> n_distinct()
+
+cat("Arm A:", n_esr1_arm_A, "/", n_patients_arm_A, "patients with ESR1 LBD mutation\n")
+cat("Arm B:", n_esr1_arm_B, "/", n_patients_arm_B, "patients with ESR1 LBD mutation\n")
+
+tab <- matrix(
+    c(n_esr1_arm_A, n_patients_arm_A - n_esr1_arm_A,
+      n_esr1_arm_B, n_patients_arm_B - n_esr1_arm_B),
+    nrow = 2, byrow = TRUE,
+    dimnames = list(Arm = c("arm_A", "arm_B"), ESR1 = c("Mutated", "Not mutated"))
+)
+tab
+fisher.test(tab)
+```
+
+```{r esr1-multiple-per-patient}
+esr1_annotated |>
+    group_by(patnr, arm) |>
+    summarize(n_mutations = n(), .groups = "drop") |>
+    filter(n_mutations > 1) |>
+    group_by(arm) |>
+    summarize(n_patients_multi_esr1 = n(), .groups = "drop")
+```
+
+## ESR1 mutation distribution
+
+```{r ccf-heatmap}
+esr1_ccf_heatmap <- esr1_annotated |>
+    mutate(arm = factor(arm, levels = c("arm_B", "arm_A"))) |>
+    ggplot(aes(
+        x = reorder(patnr, patient_ordering, decreasing = TRUE),
+        y = reorder(proteinchange_one_letter, aa_residue, decreasing = TRUE)
+    )) +
+    geom_tile(aes(fill = ccf), na.rm = TRUE, color = "black", linewidth = 0.1) +
+    scale_fill_gradientn(
+        colours = c("#132B43", "#56B1F7"),
+        values  = scales::rescale(c(0, 0.2, 1)),
+        limits  = c(0, 1),
+        breaks  = seq(0, 1, by = 0.25)
+    ) +
+    geom_text(aes(label = round(ccf, 2)), color = "white", size = 2.5, na.rm = TRUE) +
+    facet_grid(~arm, scales = "free", space = "free",
+               labeller = labeller(arm = arm_labels)) +
+    labs(
+        title = "Cancer cell fraction of ESR1 LBD mutations at progression",
+        x     = "Patient ID",
+        y     = "ESR1 mutation",
+        fill  = "CCF"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+esr1_ccf_heatmap
+ggsave("results/figures/esr1_alterations_ccf_heatmap.pdf", plot = esr1_ccf_heatmap, width = 9, height = 5)
+```
+
+```{r vaf-per-patient}
+somatic_tso500_PD_trace_variants_paired |>
+    filter(genename == "ESR1", position > 152419919, position < 152419927) |>
+    mutate(
+        esr1_common_name = case_when(
+            proteinchange == "NP_000116.2:p.(Leu536Pro)" ~ "L536P",
+            proteinchange == "NP_000116.2:p.(Leu536His)" ~ "L536H",
+            proteinchange == "NP_000116.2:p.(Leu536Arg)" ~ "L536R",
+            proteinchange == "NP_000116.2:p.(Tyr537Asn)" ~ "Y537N",
+            proteinchange == "NP_000116.2:p.(Tyr537Ser)" ~ "Y537S",
+            proteinchange == "NP_000116.2:p.(Tyr537Cys)" ~ "Y537C",
+            proteinchange == "NP_000116.2:p.(Asp538Gly)"  ~ "D538G"
+        ),
+        residue_position = as.numeric(stringr::str_extract(esr1_common_name, "[0-9]+"))
+    ) |>
+    ggplot(aes(
+        x    = reorder(esr1_common_name, residue_position),
+        y    = vaf_PD,
+        fill = esr1_common_name
+    )) +
+    geom_bar(stat = "identity", position = position_dodge2()) +
+    geom_hline(yintercept = 0.01, color = "gray", linetype = "dashed") +
+    facet_wrap(~patnr) +
+    scale_fill_manual(values = esr1_mutation_colors) +
+    coord_cartesian(ylim = c(0, 0.15)) +
+    scale_y_continuous(breaks = c(0, 0.05, 0.10, 0.15)) +
+    labs(
+        title = "Variant allele frequency of ESR1 LBD mutations at progression",
+        y     = "VAF",
+        x     = "ESR1 mutation",
+        fill  = "ESR1 mutation"
+    ) +
+    theme_light() +
+    theme(
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10),
+        legend.position  = "bottom",
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/esr1_alterations_vaf_per_patient.pdf", plot = last_plot(), width = 9, height = 6)
+```
+
+```{r butterfly-chart}
+esr1_butterfly <- esr1_annotated |>
+    group_by(arm) |>
+    mutate(n_patients_with_esr1 = n_distinct(patnr)) |>
+    ungroup() |>
+    group_by(arm, n_patients_with_esr1, genelabel, aa_residue) |>
+    summarize(n_esr1_mutation = n(), .groups = "drop") |>
+    mutate(
+        perc       = n_esr1_mutation / n_patients_with_esr1 * 100,
+        x          = ifelse(arm == "arm_A", perc, -perc),
+        x_labels   = ifelse(arm == "arm_A", perc + 19, -perc - 19),
+        perc_label = paste0(round(perc), "%")
+    ) |>
+    ggplot() +
+    geom_bar(
+        aes(y = reorder(genelabel, aa_residue, decreasing = TRUE), x = x, fill = arm),
+        stat = "identity"
+    ) +
+    geom_text(aes(
+        y     = reorder(genelabel, aa_residue, decreasing = TRUE),
+        x     = x_labels,
+        label = perc_label
+    )) +
+    coord_cartesian(xlim = c(-100, 100)) +
+    scale_x_continuous(
+        breaks = c(-100, -50, 0, 50, 100),
+        labels = c("100%", "50%", "0%", "50%", "100%")
+    ) +
+    scale_fill_manual(values = arm_colors, labels = arm_labels) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 0.3) +
+    labs(
+        x    = "% Patients",
+        y    = "ESR1 LBD mutation",
+        fill = "Treatment arm"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "none",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+esr1_butterfly
+ggsave("results/figures/esr1_alterations_butterfly_chart.pdf", plot = esr1_butterfly, width = 7, height = 5)
+```
+
+```{r combined-esr1}
+esr1_combined <- patchwork::wrap_plots(
+    esr1_ccf_heatmap,
+    esr1_butterfly + theme(axis.text.y = element_blank(), axis.title.y = element_blank()),
+    design = "AAAAAAAAAABBB#"
+)
+esr1_combined
+ggsave("results/figures/esr1_alterations_combined.pdf", plot = esr1_combined, width = 9, height = 5)
+```
+
+## Subclonal analysis of patients with multiple ESR1 mutations
+
+```{r subclonal-setup}
+patients_with_multiple_esr1 <- esr1_annotated |>
+    group_by(patnr) |>
+    summarize(n_esr1_mutations = n(), .groups = "drop") |>
+    filter(n_esr1_mutations > 1) |>
+    pull(patnr)
+
+esr1_depths <- esr1_annotated |>
+    filter(patnr %in% patients_with_multiple_esr1) |>
+    group_by(patnr) |>
+    summarize(depth = round(mean(depth)), .groups = "drop")
+
+mutation_annotation <- esr1_annotated |>
+    filter(patnr %in% patients_with_multiple_esr1) |>
+    select(patnr, vaf_PD, ccf_PD, cn_PD, proteinchange_one_letter)
+
+vaf_pairs <- purrr::map_dfr(patients_with_multiple_esr1, function(pat) {
+    vafs <- esr1_annotated |> filter(patnr == pat) |> pull(vaf_PD)
+    tidyr::expand_grid(vaf1 = vafs, vaf2 = vafs) |>
+        filter(vaf1 < vaf2) |>
+        distinct() |>
+        mutate(patnr = pat)
+}) |>
+    left_join(mutation_annotation, by = join_by(patnr, vaf1 == vaf_PD)) |>
+    left_join(mutation_annotation, by = join_by(patnr, vaf2 == vaf_PD),
+              suffix = c("_vaf1", "_vaf2"))
+
+patients_multi_esr1 <- vaf_pairs |>
+    left_join(esr1_depths, by = join_by(patnr)) |>
+    mutate(
+        patnr_label = paste0(patnr, " (", proteinchange_one_letter_vaf1,
+                             "-", proteinchange_one_letter_vaf2, ")"),
+        vaf_mean    = (vaf1 + vaf2) / 2
+    )
+```
+
+```{r empirical-null-functions}
+simulate_biallelic_ratios <- function(true_vaf, depth, n_sim = 10000) {
+    obs1   <- rbinom(n_sim, depth, true_vaf) / depth
+    obs2   <- rbinom(n_sim, depth, true_vaf) / depth
+    ratios <- pmax(obs1, obs2) / pmin(obs1, obs2)
+    ratios[is.infinite(ratios) | is.nan(ratios)] <- NA
+    ratios
+}
+
+calculate_empirical_pvalue <- function(observed_ratio, true_vaf, depth, n_sim = 10000) {
+    null_ratios <- simulate_biallelic_ratios(true_vaf, depth, n_sim)
+    mean(null_ratios >= observed_ratio, na.rm = TRUE)
+}
+
+classify_patients <- function(df, alpha = 0.05, n_sim = 10000) {
+    df |>
+        mutate(ratio = pmax(vaf1, vaf2) / pmin(vaf1, vaf2)) |>
+        rowwise() |>
+        mutate(
+            p_value       = calculate_empirical_pvalue(ratio, vaf_mean, depth, n_sim),
+            p_value_label = dplyr::case_when(
+                p_value < 0.001 ~ "< 0.001",
+                p_value < 0.01  ~ sprintf("%.3f", p_value),
+                TRUE            ~ sprintf("%.2f", p_value)
+            ),
+            classification = ifelse(p_value < alpha, "Likely subclonal", "Likely biallelic")
+        ) |>
+        ungroup()
+}
+```
+
+```{r empirical-classification}
+set.seed(42)
+results_empirical <- classify_patients(patients_multi_esr1)
+
+results_empirical |>
+    select(patnr_label, vaf1, vaf2, ratio, p_value_label, classification) |>
+    arrange(p_value_label)
+```
+
+```{r null-distributions-plot}
+set.seed(42)
+null_data <- results_empirical |>
+    rowwise() |>
+    mutate(null_ratios = list(simulate_biallelic_ratios(vaf_mean, depth, n_sim = 10000))) |>
+    tidyr::unnest(null_ratios) |>
+    select(patnr_label, null_ratios, ratio, p_value_label, classification)
+
+patient_cutoffs <- null_data |>
+    group_by(patnr_label, ratio, p_value_label, classification) |>
+    summarize(cutoff_95 = quantile(null_ratios, 0.95, na.rm = TRUE), .groups = "drop")
+
+ggplot() +
+    geom_histogram(
+        data = null_data,
+        aes(x = null_ratios, y = after_stat(density)),
+        bins = 40, fill = "grey70", color = "white"
+    ) +
+    geom_vline(
+        data = patient_cutoffs,
+        aes(xintercept = cutoff_95),
+        linetype = "dashed", color = "grey40"
+    ) +
+    geom_vline(
+        data = patient_cutoffs,
+        aes(xintercept = ratio, color = classification),
+        linewidth = 1
+    ) +
+    geom_text(
+        data = patient_cutoffs,
+        aes(x = Inf, y = Inf, label = paste0("p = ", p_value_label)),
+        hjust = 1.1, vjust = 1.3, size = 3
+    ) +
+    scale_x_log10() +
+    scale_color_manual(
+        values = c("Likely subclonal" = "steelblue", "Likely biallelic" = "forestgreen")
+    ) +
+    facet_wrap(~patnr_label, scales = "free") +
+    labs(
+        title = "Null distributions for subclonality of ESR1 LBD mutations",
+        x     = "VAF ratio",
+        y     = "Density",
+        color = ""
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(face = "bold", size = 15),
+        strip.text       = element_text(face = "bold"),
+        strip.background = element_rect(fill = "lightgray")
+    )
+ggsave("results/figures/esr1_alterations_null_distributions.pdf", plot = last_plot(), width = 9, height = 6)
+```
+
+```{r vaf-scatter}
+results_empirical |>
+    ggplot(aes(x = vaf1, y = vaf2, color = classification)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+    geom_point(size = 4, alpha = 0.8) +
+    ggrepel::geom_label_repel(
+        aes(label = ifelse(classification == "Likely subclonal", patnr_label, NA)),
+        size = 3, box.padding = 1, point.padding = 0.5,
+        segment.color = "grey40", min.segment.length = 0,
+        max.overlaps = Inf, fill = "white", show.legend = FALSE, na.rm = TRUE
+    ) +
+    scale_color_manual(
+        values = c("Likely subclonal" = "steelblue", "Likely biallelic" = "forestgreen")
+    ) +
+    labs(
+        title = "VAF comparison of co-occurring ESR1 LBD mutations",
+        x     = "VAF of ESR1 mutation 1",
+        y     = "VAF of ESR1 mutation 2",
+        color = ""
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 10),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/esr1_alterations_vaf_scatter.pdf", plot = last_plot(), width = 7, height = 6)
+```
+
+```{r bayesian-subclonal-function}
+bayesian_subclonal_test <- function(wt, mut1, mut2, alpha = c(1, 0.1, 0.1), n_samples = 10000) {
+    posterior_alpha   <- alpha + c(wt, mut1, mut2)
+    posterior_samples <- MCMCpack::rdirichlet(n_samples, posterior_alpha)
+    diff_samples      <- posterior_samples[, 2] - posterior_samples[, 3]
+    ci_95             <- quantile(diff_samples, c(0.025, 0.975))
+
+    list(
+        posterior1     = posterior_samples[, 1],
+        posterior2     = posterior_samples[, 2],
+        posterior3     = posterior_samples[, 3],
+        difference     = mean(diff_samples),
+        ci_lower       = ci_95[1],
+        ci_upper       = ci_95[2],
+        prob_dominant  = mean(diff_samples > 0),
+        is_subclonal   = !dplyr::between(0, ci_95[1], ci_95[2]),
+        posterior_diff = diff_samples
+    )
+}
+```
+
+```{r bayesian-apply}
+set.seed(42)
+results_bayesian <- vaf_pairs |>
+    left_join(esr1_depths, by = join_by(patnr)) |>
+    mutate(
+        patnr_label = paste0(patnr, " (", proteinchange_one_letter_vaf1,
+                             "-", proteinchange_one_letter_vaf2, ")"),
+        count_mut1  = round(vaf1 * depth),
+        count_mut2  = round(vaf2 * depth),
+        count_wt    = depth - count_mut1 - count_mut2
+    ) |>
+    rowwise() |>
+    mutate(bayes = list(bayesian_subclonal_test(count_wt, count_mut1, count_mut2))) |>
+    ungroup() |>
+    mutate(
+        difference     = purrr::map_dbl(bayes, "difference"),
+        ci_lower       = purrr::map_dbl(bayes, "ci_lower"),
+        ci_upper       = purrr::map_dbl(bayes, "ci_upper"),
+        is_subclonal   = purrr::map_lgl(bayes, "is_subclonal"),
+        posterior_diff = purrr::map(bayes, "posterior_diff"),
+        posterior2     = purrr::map(bayes, "posterior2"),
+        posterior3     = purrr::map(bayes, "posterior3"),
+        p_value        = purrr::map_dbl(
+            posterior_diff,
+            ~ 2 * min(mean(.x >= 0), mean(.x <= 0))
+        ),
+        classification = ifelse(is_subclonal, "Likely subclonal", "Likely biallelic")
+    )
+
+cat("Subclonal pairs:", sum(results_bayesian$is_subclonal), "/", nrow(results_bayesian), "\n")
+results_bayesian |>
+    select(patnr_label, vaf1, vaf2, difference, is_subclonal, p_value, classification) |>
+    arrange(p_value)
+```
+
+```{r posterior-density}
+results_bayesian |>
+    select(patnr_label, posterior2, posterior3) |>
+    tidyr::unnest(c(posterior2, posterior3)) |>
+    tidyr::pivot_longer(
+        cols      = c(posterior2, posterior3),
+        names_to  = "mutation",
+        values_to = "posterior_prob"
+    ) |>
+    ggplot(aes(x = posterior_prob, fill = mutation)) +
+    geom_density(alpha = 0.6) +
+    facet_wrap(~patnr_label, scales = "free_y") +
+    scale_fill_manual(
+        values = c(posterior2 = "steelblue", posterior3 = "#D62728"),
+        labels = c(posterior2 = "ESR1 LBD mutation 1", posterior3 = "ESR1 LBD mutation 2"),
+        name   = ""
+    ) +
+    labs(
+        title = "Posterior distributions of ESR1 LBD mutation prevalences",
+        x     = "Posterior probability",
+        y     = "Density"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        axis.text.y      = element_blank(),
+        strip.background = element_rect(fill = "gray90"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/esr1_alterations_posterior_density.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+```{r posterior-density-per-patient}
+# Reshape results_bayesian: each pair row contributes 2 mutation posteriors.
+# Deduplicate to one posterior per (patnr, mutation), then rank by descending VAF
+# so mut1 = highest VAF, mut2 = next, mut3 = lowest.
+posteriors_long <- dplyr::bind_rows(
+    results_bayesian |>
+        select(patnr,
+               mutation  = proteinchange_one_letter_vaf1,
+               vaf       = vaf1,
+               posterior = posterior2),
+    results_bayesian |>
+        select(patnr,
+               mutation  = proteinchange_one_letter_vaf2,
+               vaf       = vaf2,
+               posterior = posterior3)
+) |>
+    distinct(patnr, mutation, vaf, .keep_all = TRUE) |>
+    arrange(patnr, desc(vaf)) |>
+    group_by(patnr) |>
+    mutate(mut_rank = row_number()) |>
+    ungroup()
+
+patient_facet_labels <- posteriors_long |>
+    arrange(patnr, mut_rank) |>
+    group_by(patnr) |>
+    summarize(
+        facet_label = paste0(unique(patnr), " (", paste(mutation, collapse = "-"), ")"),
+        .groups    = "drop"
+    )
+
+posteriors_long |>
+    left_join(patient_facet_labels, by = join_by(patnr)) |>
+    tidyr::unnest(posterior) |>
+    mutate(mut_rank = as.character(mut_rank)) |>
+    ggplot(aes(x = posterior, fill = mut_rank)) +
+    geom_density(alpha = 0.6, color = "black", linewidth = 0.3) +
+    facet_wrap(~facet_label, scales = "free_y") +
+    scale_fill_manual(
+        values = c("1" = "steelblue", "2" = "#D62728", "3" = "#2CA02C"),
+        labels = c("1" = "ESR1 LBD mutation 1", "2" = "ESR1 LBD mutation 2", "3" = "ESR1 LBD mutation 3"),
+        name   = "",
+        drop   = TRUE
+    ) +
+    labs(
+        title = "Posterior distributions of ESR1 LBD mutation prevalences",
+        x     = "Posterior probability",
+        y     = "Density"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        axis.text.y      = element_blank(),
+        strip.background = element_rect(fill = "gray90"),
+        strip.text       = element_text(color = "black", size = 8)
+    )
+ggsave("results/figures/esr1_alterations_posterior_density_per_patient.pdf", plot = last_plot(), width = 9, height = 5)
+```
+
+```{r posterior-difference}
+results_bayesian |>
+    select(patnr_label, posterior_diff) |>
+    tidyr::unnest(posterior_diff) |>
+    ggplot(aes(x = posterior_diff)) +
+    geom_density(fill = "steelblue", alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    facet_wrap(~patnr_label, scales = "free_y") +
+    labs(
+        title = "Posterior difference distributions for ESR1 subclonal analysis",
+        x     = "Posterior difference (mutation 1 − mutation 2)",
+        y     = "Density"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/esr1_alterations_posterior_difference.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+```{r ccf-scatter-bayesian}
+results_bayesian |>
+    ggplot(aes(x = ccf_PD_vaf1, y = ccf_PD_vaf2, color = classification)) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") +
+    geom_point(size = 4, alpha = 0.8) +
+    ggrepel::geom_label_repel(
+        aes(label = ifelse(is_subclonal, patnr_label, NA)),
+        size = 3.5, box.padding = 1, point.padding = 0.5,
+        segment.color = "grey40", min.segment.length = 0,
+        max.overlaps = Inf, fill = "white", show.legend = FALSE, na.rm = TRUE
+    ) +
+    scale_color_manual(
+        values = c("Likely subclonal" = "steelblue", "Likely biallelic" = "forestgreen")
+    ) +
+    labs(
+        title = "Bayesian analysis of co-occurring ESR1 LBD mutations",
+        x     = "CCF of ESR1 mutation 1",
+        y     = "CCF of ESR1 mutation 2",
+        color = ""
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/esr1_alterations_ccf_scatter_bayesian.pdf", plot = last_plot(), width = 7, height = 6)
+```
+
+
+
+

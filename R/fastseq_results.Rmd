@@ -1,0 +1,174 @@
+---
+title: "mFast-SeqS results"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r colors-labels}
+timepoint_arm_A_colors     <- c("BL" = "#A6C8E0", "PD" = "#4E79A7")
+timepoint_arm_B_colors     <- c("BL" = "#F8C99B", "PD" = "#F28E2B")
+timepoint_labels           <- c("BL" = "Baseline", "PD" = "Progression")
+timepoint_both_arms_colors <- c("arm_A_BL" = "#A6C8E0", "arm_A_PD" = "#4E79A7",
+                                "arm_B_BL" = "#F8C99B", "arm_B_PD" = "#F28E2B")
+timepoint_both_arms_labels <- c("arm_A_BL" = "Baseline (combination treatment)",
+                                "arm_A_PD" = "Progression (combination treatment)",
+                                "arm_B_BL" = "Baseline (monotherapy)",
+                                "arm_B_PD" = "Progression (monotherapy)")
+```
+
+```{r tf-estimates}
+tf_estimates_ichorCNA <- estimatesIchorCNA_sonia |>
+    group_by(sampleName_shWGS) |>
+    summarise(tumorFractionEstimate = unique(tumorFractionEstimate), .groups = "drop") |>
+    left_join(meta_data, by = join_by(sampleName_shWGS)) |>
+    arrange(desc(tumorFractionEstimate))
+```
+
+## Z-score summary
+
+```{r zscore-summary}
+fastqseq_zscores |>
+    group_by(arm, timepoint) |>
+    summarise(
+        mean = mean(zscore),
+        min  = min(zscore),
+        max  = max(zscore),
+        .groups = "drop"
+    )
+```
+
+## Z-scores per patient
+
+```{r zscore-arm-a}
+fastqseq_zscores |>
+    filter(arm == "arm_A") |>
+    ggplot(aes(x = reorder(patnr, patnr), y = zscore, fill = timepoint)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = timepoint_arm_A_colors) +
+    theme_light() +
+    labs(
+        title = "Fastseq Z-scores of patients in combination treatment arm (AI + CDK4/6i)",
+        x     = "Patient ID",
+        y     = "Z-score"
+    ) +
+    theme(
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fastseq_results_zscore_arm_a.pdf", plot = last_plot(), width = 9, height = 5)
+```
+
+```{r zscore-arm-b}
+fastqseq_zscores |>
+    filter(arm == "arm_B") |>
+    ggplot(aes(x = reorder(patnr, patnr), y = zscore, fill = timepoint)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = timepoint_arm_B_colors) +
+    theme_light() +
+    labs(
+        title = "Fastseq Z-scores of patients in monotherapy arm (AI)",
+        x     = "Patient ID",
+        y     = "Z-score"
+    ) +
+    theme(
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fastseq_results_zscore_arm_b.pdf", plot = last_plot(), width = 9, height = 5)
+```
+
+## Z-score vs tumor fraction
+
+```{r zscore-vs-tf}
+tf_estimates_ichorCNA |>
+    left_join(fastqseq_zscores, by = join_by(patnr, arm, timepoint, sampleName_fastseq)) |>
+    mutate(arm_timepoint = paste0(arm, "_", timepoint)) |>
+    ggplot(aes(x = zscore, y = tumorFractionEstimate, color = arm_timepoint)) +
+    geom_smooth(aes(x = zscore, y = tumorFractionEstimate),
+                color = "black", method = "lm", se = FALSE, alpha = 0.3, linewidth = 0.8) +
+    geom_point(size = 3) +
+    scale_color_manual(values = timepoint_both_arms_colors, labels = timepoint_both_arms_labels) +
+    scale_x_log10() +
+    ggpubr::stat_cor(p.accuracy = 0.001, method = "spearman", size = 5,
+                     hjust = -0.1, cor.coef.name = "rho", color = "black") +
+    geom_vline(xintercept = 4, alpha = 0.7) +
+    theme_light() +
+    labs(
+        title  = "mFast-SeqS selects high tumour load patients",
+        x      = "mFast-SeqS Z-score",
+        y      = "Tumour fraction estimate (sWGS)",
+        color  = "Timepoint:"
+    ) +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE)) +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        legend.text      = element_text(size = 9, family = "Helvetica", face = "bold"),
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fastseq_results_zscore_vs_tumour_fraction.pdf", plot = last_plot(), width = 7, height = 6)
+```
+
+## Predict TF for samples without sWGS
+
+```{r predict-tf}
+tf_fastseq_scores <- tf_estimates_ichorCNA |>
+    filter(!sampleName_fastseq %in% c("L10176")) |>
+    left_join(fastqseq_zscores, by = join_by(patnr, arm, timepoint, sampleName_fastseq)) |>
+    mutate(arm_timepoint = paste0(arm, "_", timepoint))
+
+model_log <- lm(tumorFractionEstimate ~ log10(zscore), data = tf_fastseq_scores)
+summary(model_log)$r.squared
+
+new_data  <- data.frame(zscore = c(5.46, 120.8, 4.83))
+predict(model_log, newdata = new_data, interval = "prediction")
+```
+
+```{r loo-validation}
+loo_predictions <- purrr::map_dfr(seq_len(nrow(tf_fastseq_scores)), function(i) {
+    train     <- tf_fastseq_scores[-i, ]
+    test      <- tf_fastseq_scores[i, ]
+    loo_model <- lm(tumorFractionEstimate ~ log10(zscore), data = train)
+    tibble::tibble(
+        predicted = predict(loo_model, newdata = test),
+        observed  = test$tumorFractionEstimate
+    )
+})
+
+cor.test(loo_predictions$observed, loo_predictions$predicted, method = "spearman")
+sqrt(mean((loo_predictions$observed - loo_predictions$predicted)^2))
+```
+
+
+```{r}
+
+```
+

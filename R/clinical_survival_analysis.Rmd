@@ -1,0 +1,352 @@
+---
+title: "Clinical survival analysis"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-clinical-data, include=FALSE}
+load("data/clinical_data_sonia.Rdata")
+
+SONIA_clinical_data <- ctdnadatalist[[1]]
+SONIA_bor           <- ctdnadatalist[[14]]
+SONIA_target        <- ctdnadatalist[[3]]
+
+# Patients in the ctDNA (biomarker) cohort
+sample_data <- readxl::read_excel("data/meta_data_SONIA_v6.xlsx") |>
+    distinct(patnr)
+
+# Determine whether each patient has target lesions
+target_per_patient <- SONIA_target |>
+    mutate(target = ifelse(tlnd == "Yes", "non-target", "target")) |>
+    group_by(patnr) |>
+    slice(1) |>
+    ungroup() |>
+    select(patnr, target)
+
+# Score each response assessment, then keep the best (highest) per patient
+best_response_per_patient <- SONIA_bor |>
+    left_join(target_per_patient, by = "patnr") |>
+    mutate(response_score = case_when(
+        target == "non-target" & rspoa == "CR"            ~ 4,
+        target == "non-target" & rspoa == "non CR/non PD" ~ 3,
+        target == "non-target" & rspoa == "NE"            ~ 2,
+        target == "non-target" & rspoa == "PD"            ~ 1,
+        target == "target"     & rspoa == "CR"            ~ 4,
+        target == "target"     & rspoa == "PR"            ~ 3,
+        target == "target"     & rspoa == "SD"            ~ 2,
+        target == "target"     & rspoa == "NE"            ~ 1,
+        target == "target"     & rspoa == "PD"            ~ 0,
+        TRUE ~ NA_real_
+    )) |>
+    group_by(patnr) |>
+    slice_max(order_by = response_score, with_ties = FALSE) |>
+    ungroup() |>
+    select(patnr, rspoa)
+
+# Attach best response and derive clinical variables
+SONIA_clinical_data <- SONIA_clinical_data |>
+    left_join(best_response_per_patient, by = "patnr") |>
+    mutate(
+        rspoa      = as.character(rspoa),
+        rspoa      = ifelse(is.na(rspoa), "NE", rspoa),
+        who_binary = ifelse(who == 0, 0, 1),
+        # Two patients never started 1st line: impute 0 days
+        lijn1days  = case_when(
+            patnr == 86  ~ 0,
+            patnr == 689 ~ 0,
+            TRUE ~ as.numeric(lijn1days)
+        ),
+        lijn1mth = lijn1days / 365.25 * 12,
+        lijn1yr  = lijn1days / 365.25
+    )
+```
+
+```{r build-cohorts, include=FALSE}
+# Biomarker cohort: SONIA patients with a ctDNA sample
+SONIA_sample_data_merged <- SONIA_clinical_data |>
+    semi_join(sample_data, by = "patnr") |>
+    mutate(group = "biomarker cohort")
+
+# Non-biomarker cohort: the remaining SONIA patients
+Data_SONIA_outside <- SONIA_clinical_data |>
+    anti_join(sample_data, by = "patnr") |>
+    mutate(group = "non-biomarker cohort")
+
+# Combined dataset for biomarker vs non-biomarker comparisons
+combined_data <- bind_rows(SONIA_sample_data_merged, Data_SONIA_outside)
+
+# Per-arm subsets within the biomarker cohort
+arm_A <- SONIA_sample_data_merged |> filter(arm == "Arm A")
+arm_B <- SONIA_sample_data_merged |> filter(arm == "Arm B")
+
+# Fisher's exact / chi-square helpers that align factor levels across groups
+run_fisher <- function(x, y) {
+    lev <- union(names(table(x)), names(table(y)))
+    tab <- rbind(table(factor(x, levels = lev)),
+                 table(factor(y, levels = lev)))
+    fisher.test(tab)
+}
+
+run_chisq <- function(x, y) {
+    lev <- union(names(table(x)), names(table(y)))
+    tab <- rbind(table(factor(x, levels = lev)),
+                 table(factor(y, levels = lev)))
+    chisq.test(tab)
+}
+```
+
+## 1. Baseline characteristics: Arm A vs Arm B (biomarker cohort)
+
+```{r baseline-by-arm}
+cat("=== Arm A (n =", nrow(arm_A), ") ===\n")
+cat("Age: median =", median(arm_A$age, na.rm = TRUE),
+    ", IQR =", IQR(arm_A$age, na.rm = TRUE),
+    ", range =", paste(range(arm_A$age, na.rm = TRUE), collapse = "-"), "\n")
+print(table(arm_A$who_binary))
+print(table(arm_A$newlymeta))
+print(table(arm_A$viscyn))
+print(table(arm_A$boneonly))
+print(table(arm_A$histology))
+print(table(arm_A$firsttrip))
+print(table(arm_A$rspoa))
+
+cat("\n=== Arm B (n =", nrow(arm_B), ") ===\n")
+cat("Age: median =", median(arm_B$age, na.rm = TRUE),
+    ", IQR =", IQR(arm_B$age, na.rm = TRUE),
+    ", range =", paste(range(arm_B$age, na.rm = TRUE), collapse = "-"), "\n")
+print(table(arm_B$who_binary))
+print(table(arm_B$newlymeta))
+print(table(arm_B$viscyn))
+print(table(arm_B$boneonly))
+print(table(arm_B$histology))
+print(table(arm_B$firsttrip))
+print(table(arm_B$rspoa))
+
+# Age: t-test
+print(t.test(arm_A$age, arm_B$age))
+
+# Categorical variables: Fisher's exact test (small samples)
+print(run_fisher(arm_A$who_binary, arm_B$who_binary))
+print(run_fisher(arm_A$newlymeta,  arm_B$newlymeta))
+print(run_fisher(arm_A$viscyn,     arm_B$viscyn))
+print(run_fisher(arm_A$boneonly,   arm_B$boneonly))
+print(run_fisher(arm_A$histology,  arm_B$histology))
+print(run_fisher(arm_A$rspoa,      arm_B$rspoa))
+print(run_fisher(arm_A$firsttrip,  arm_B$firsttrip))
+```
+
+## 2. Time on first-line treatment: Arm A vs Arm B
+
+```{r lijn1-by-arm}
+fit_lijn1_arm <- survival::survfit(
+    survival::Surv(lijn1mth, lijn1af) ~ arm,
+    data = SONIA_sample_data_merged
+)
+
+print(survival::survdiff(
+    survival::Surv(lijn1mth, lijn1af) ~ arm,
+    data = SONIA_sample_data_merged
+))
+
+round(summary(fit_lijn1_arm)$table[, c("median", "0.95LCL", "0.95UCL")], 1)
+```
+
+## 3. Progression-free survival: Arm A vs Arm B
+
+```{r pfs1-by-arm}
+surv_pfs1   <- survival::Surv(SONIA_sample_data_merged$pfs1mth, SONIA_sample_data_merged$pfs1event)
+fit_pfs1    <- survival::survfit(surv_pfs1 ~ arm, data = SONIA_sample_data_merged)
+cox_pfs1    <- survival::coxph(surv_pfs1 ~ arm, data = SONIA_sample_data_merged)
+ph_pfs1     <- survival::cox.zph(cox_pfs1)
+
+cat("=== PFS1 medians (months) ===\n")
+print(round(summary(fit_pfs1)$table[, c("median", "0.95LCL", "0.95UCL")], 1))
+cat("\n=== Cox model (PFS1 ~ arm) ===\n")
+print(summary(cox_pfs1)$conf.int)
+cat("PH test p =", round(ph_pfs1$table["arm", "p"], 3), "\n")
+
+km_pfs1 <- survminer::ggsurvplot(
+    fit_pfs1,
+    data         = SONIA_sample_data_merged,
+    pval         = TRUE,
+    risk.table   = "nrisk_cumcensor",
+    censor       = TRUE,
+    conf.int     = TRUE,
+    title        = "PFS in combination treatment and monotherapy arms",
+    legend.title = "",
+    legend.labs  = c("Combination arm", "Monotherapy arm"),
+    legend       = "none",
+    xlab         = "Time (months)",
+    xlim         = c(0, 30),
+    break.time.by = 5,
+    palette      = c("#0072B2", "#E69F00"),
+    ggtheme      = theme_light() +
+        theme(
+            plot.title       = element_text(size = 15, face = "bold"),
+            axis.title       = element_text(size = 15, face = "bold"),
+            axis.text.x      = element_text(size = 10),
+            legend.position  = "bottom",
+            strip.background = element_rect(fill = "lightgray"),
+            strip.text       = element_text(color = "black", size = 10)
+        )
+)
+print(km_pfs1)
+ggpubr::ggexport(km_pfs1, filename = "results/figures/clinical_survival_pfs1_by_arm.pdf", width = 7, height = 5)
+```
+
+## 4. Overall survival: Arm A vs Arm B
+
+```{r os-by-arm}
+surv_os_bio <- survival::Surv(SONIA_sample_data_merged$osmth, SONIA_sample_data_merged$osevent)
+fit_os_bio  <- survival::survfit(surv_os_bio ~ arm, data = SONIA_sample_data_merged)
+cox_os_bio  <- survival::coxph(surv_os_bio ~ arm, data = SONIA_sample_data_merged)
+ph_os_bio   <- survival::cox.zph(cox_os_bio)
+
+cat("=== OS medians (months) ===\n")
+print(round(summary(fit_os_bio)$table[, c("median", "0.95LCL", "0.95UCL")], 1))
+cat("\n=== Cox model (OS ~ arm) ===\n")
+print(summary(cox_os_bio)$conf.int)
+cat("PH test p =", round(ph_os_bio$table["arm", "p"], 3), "\n")
+
+km_os_bio <- survminer::ggsurvplot(
+    fit_os_bio,
+    data         = SONIA_sample_data_merged,
+    pval         = TRUE,
+    risk.table   = "nrisk_cumcensor",
+    censor       = TRUE,
+    conf.int     = TRUE,
+    title        = "OS in combination treatment and monotherapy arms",
+    legend.title = "",
+    legend.labs  = c("Combination arm", "Monotherapy arm"),
+    legend       = "none",
+    xlab         = "Time (months)",
+    xlim         = c(0, 36),
+    break.time.by = 5,
+    palette      = c("#0072B2", "#E69F00"),
+    ggtheme      = theme_light() +
+        theme(
+            plot.title       = element_text(size = 15, face = "bold"),
+            axis.title       = element_text(size = 15, face = "bold"),
+            axis.text.x      = element_text(size = 10),
+            legend.position  = "bottom",
+            strip.background = element_rect(fill = "lightgray"),
+            strip.text       = element_text(color = "black", size = 10)
+        )
+)
+print(km_os_bio)
+ggpubr::ggexport(km_os_bio, filename = "results/figures/clinical_survival_os_by_arm.pdf", width = 7, height = 5)
+```
+
+## 5. Baseline characteristics: biomarker vs non-biomarker cohort
+
+```{r cohort-comparison}
+cat("Biomarker cohort age: median =", median(SONIA_sample_data_merged$age, na.rm = TRUE),
+    ", range =", paste(range(SONIA_sample_data_merged$age, na.rm = TRUE), collapse = "-"), "\n")
+cat("Non-biomarker cohort age: median =", median(Data_SONIA_outside$age, na.rm = TRUE),
+    ", range =", paste(range(Data_SONIA_outside$age, na.rm = TRUE), collapse = "-"), "\n")
+print(t.test(SONIA_sample_data_merged$age, Data_SONIA_outside$age))
+
+# Categorical variables: chi-square test (large samples)
+print(run_chisq(SONIA_sample_data_merged$arm,        Data_SONIA_outside$arm))
+print(run_chisq(SONIA_sample_data_merged$who_binary, Data_SONIA_outside$who_binary))
+print(run_chisq(SONIA_sample_data_merged$newlymeta,  Data_SONIA_outside$newlymeta))
+print(run_chisq(SONIA_sample_data_merged$viscyn,     Data_SONIA_outside$viscyn))
+print(run_chisq(SONIA_sample_data_merged$boneonly,   Data_SONIA_outside$boneonly))
+print(run_chisq(SONIA_sample_data_merged$histology,  Data_SONIA_outside$histology))
+print(run_chisq(SONIA_sample_data_merged$firsttrip,  Data_SONIA_outside$firsttrip))
+print(run_chisq(SONIA_sample_data_merged$rspoa,      Data_SONIA_outside$rspoa))
+
+# Time on first-line treatment: biomarker vs non-biomarker
+fit_lijn1_group <- survival::survfit(
+    survival::Surv(lijn1mth, lijn1af) ~ group,
+    data = combined_data
+)
+print(survival::survdiff(
+    survival::Surv(lijn1mth, lijn1af) ~ group,
+    data = combined_data
+))
+round(summary(fit_lijn1_group)$table[, c("median", "0.95LCL", "0.95UCL")], 1)
+```
+
+## 6. Progression-free survival: biomarker vs non-biomarker cohort
+
+```{r pfs1-combined}
+surv_pfs1_grp <- survival::Surv(combined_data$pfs1mth, combined_data$pfs1event)
+fit_pfs1_grp  <- survival::survfit(surv_pfs1_grp ~ group, data = combined_data)
+
+cat("=== PFS1 medians (months) ===\n")
+print(round(summary(fit_pfs1_grp)$table[, c("median", "0.95LCL", "0.95UCL")], 1))
+
+km_pfs1_comb <- survminer::ggsurvplot(
+    fit_pfs1_grp,
+    data         = combined_data,
+    pval         = TRUE,
+    risk.table   = "nrisk_cumcensor",
+    censor       = TRUE,
+    conf.int     = TRUE,
+    title        = "PFS in biomarker and non-biomarker SONIA cohort",
+    legend.title = "",
+    legend.labs  = c("Biomarker cohort", "Non-biomarker cohort"),
+    legend       = "none",
+    xlab         = "Time (months)",
+    xlim         = c(0, 30),
+    break.time.by = 5,
+    palette      = c("#0072B2", "#E69F00"),
+    ggtheme      = theme_light() +
+        theme(
+            plot.title       = element_text(size = 15, face = "bold"),
+            axis.title       = element_text(size = 15, face = "bold"),
+            axis.text.x      = element_text(size = 10),
+            legend.position  = "bottom",
+            strip.background = element_rect(fill = "lightgray"),
+            strip.text       = element_text(color = "black", size = 10)
+        )
+)
+print(km_pfs1_comb)
+ggpubr::ggexport(km_pfs1_comb, filename = "results/figures/clinical_survival_pfs1_biomarker_vs_nonbiomarker.pdf", width = 7, height = 5)
+```
+
+## 7. Overall survival: biomarker vs non-biomarker cohort
+
+```{r os-combined}
+surv_os_grp <- survival::Surv(combined_data$osmth, combined_data$osevent)
+fit_os_grp  <- survival::survfit(surv_os_grp ~ group, data = combined_data)
+
+cat("=== OS medians (months) ===\n")
+print(round(summary(fit_os_grp)$table[, c("median", "0.95LCL", "0.95UCL")], 1))
+
+km_os_comb <- survminer::ggsurvplot(
+    fit_os_grp,
+    data         = combined_data,
+    pval         = TRUE,
+    risk.table   = "nrisk_cumcensor",
+    censor       = TRUE,
+    conf.int     = TRUE,
+    title        = "OS in biomarker and non-biomarker SONIA cohort",
+    legend.title = "",
+    legend.labs  = c("Biomarker cohort", "Non-biomarker cohort"),
+    legend       = "none",
+    xlab         = "Time (months)",
+    xlim         = c(0, 60),
+    break.time.by = 5,
+    palette      = c("#0072B2", "#E69F00"),
+    ggtheme      = theme_light() +
+        theme(
+            plot.title       = element_text(size = 15, face = "bold"),
+            axis.title       = element_text(size = 15, face = "bold"),
+            axis.text.x      = element_text(size = 10),
+            legend.position  = "bottom",
+            strip.background = element_rect(fill = "lightgray"),
+            strip.text       = element_text(color = "black", size = 10)
+        )
+)
+print(km_os_comb)
+ggpubr::ggexport(km_os_comb, filename = "results/figures/clinical_survival_os_biomarker_vs_nonbiomarker.pdf", width = 7, height = 5)
+```

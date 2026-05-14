@@ -1,0 +1,546 @@
+---
+title: "Fragmentomics - ER status prediction"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r colors-labels}
+arm_colors           <- c("arm_A" = "#4E79A7", "arm_B" = "#F28E2B")
+arm_labels           <- c("arm_A" = "Combination treatment arm", "arm_B" = "Monotherapy arm")
+timepoint_colors     <- c("BL" = "#A6C8E0", "PD" = "#F28E2B")
+timepoint_labels     <- c("BL" = "Baseline", "PD" = "Progression")
+er_prediction_colors <- c("ER+" = "#E15759", "ER-" = "#4E79A7")
+outlier_colors       <- c("L8788" = "#E15759", "L9747" = "#4E79A7")
+outlier_patnr_colors <- c("541"   = "#E15759", "1040"  = "#4E79A7")
+```
+
+## ER status prediction
+
+```{r paired-trajectories}
+paired_plot_data <- griffin_data |>
+    select(sampleName_shWGS, patnr, arm, timepoint, ER_probability, is_outlier) |>
+    group_by(patnr) |>
+    filter(n() == 2) |>
+    ungroup()
+
+ggplot(paired_plot_data, aes(x = timepoint, y = ER_probability)) +
+    geom_line(aes(group = patnr, color = arm), alpha = 0.4, linewidth = 0.4) +
+    geom_point(aes(color = arm), size = 2.5, alpha = 0.7) +
+    geom_point(
+        data    = paired_plot_data |> filter(is_outlier),
+        color   = "black", size = 4, shape = 1, stroke = 1.2
+    ) +
+    ggrepel::geom_text_repel(
+        data      = paired_plot_data |> filter(is_outlier),
+        aes(label = patnr),
+        color = "black", size = 3, nudge_x = 0.2
+    ) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = arm_colors, labels = arm_labels, name = "Treatment arm") +
+    scale_x_discrete(labels = timepoint_labels) +
+    labs(
+        title = "ER subtype probability: baseline to progression",
+        x     = "Timepoint",
+        y     = "P(ER+)"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_er_probability_trajectories.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+```{r er-vs-tf}
+pd_data  <- griffin_data |> filter(timepoint == "PD", !is.na(tumor_fraction))
+cor_test <- cor.test(pd_data$tumor_fraction, pd_data$ER_probability, method = "spearman")
+
+pd_data |>
+    ggplot(aes(x = tumor_fraction, y = ER_probability)) +
+    geom_point(aes(color = arm), size = 2.5, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "grey30", linetype = "dashed") +
+    geom_point(
+        data    = pd_data |> filter(is_outlier),
+        color   = "black", size = 4, shape = 1, stroke = 1.2
+    ) +
+    ggrepel::geom_text_repel(
+        data      = pd_data |> filter(is_outlier),
+        aes(label = patnr),
+        color = "black", size = 3
+    ) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = 0.05, linetype = "dotted", color = "red",    alpha = 0.6) +
+    geom_vline(xintercept = 0.10, linetype = "dotted", color = "orange", alpha = 0.6) +
+    scale_color_manual(values = arm_colors, labels = arm_labels, name = "Treatment arm") +
+    labs(
+        title    = "ER probability vs tumour fraction at progression",
+        subtitle = sprintf("Spearman rho = %.2f, p < 0.001", cor_test$estimate),
+        x        = "Tumour fraction (ichorCNA)",
+        y        = "P(ER+)"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_er_probability_vs_tumour_fraction.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+## Nucleosome coverage profiles
+
+```{r mean-coverage-profiles, fig.width=12, fig.height=8}
+coverage_annotated |>
+    group_by(site_name_clean, position, ER_prediction_label) |>
+    summarise(mean_coverage = mean(coverage, na.rm = TRUE), .groups = "drop") |>
+    ggplot(aes(x = position, y = mean_coverage, color = ER_prediction_label)) +
+    geom_line(linewidth = 0.8) +
+    facet_wrap(~site_name_clean, scales = "free_y", ncol = 2) +
+    scale_color_manual(values = er_prediction_colors, name = "ER prediction") +
+    labs(
+        title = "Mean nucleosome coverage profiles by ER prediction",
+        x     = "Position relative to site center (bp)",
+        y     = "Normalized coverage"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_mean_coverage_profiles_by_er_prediction.pdf", plot = last_plot(), width = 12, height = 8)
+```
+
+```{r outlier-profiles, fig.width=12, fig.height=8}
+cohort_ribbon <- coverage_annotated |>
+    group_by(site_name_clean, position) |>
+    summarise(
+        mean_cov = mean(coverage, na.rm = TRUE),
+        sd_cov   = sd(coverage,   na.rm = TRUE),
+        .groups  = "drop"
+    )
+
+outlier_profiles <- coverage_annotated |>
+    filter(is_outlier) |>
+    select(site_name_clean, position, coverage, sample, patnr) |>
+    rename(mean_coverage = coverage)
+
+overlay_data <- bind_rows(
+    cohort_ribbon |> mutate(sample = "Cohort Mean", mean_coverage = mean_cov),
+    outlier_profiles
+)
+
+site_labels <- c(
+    "ER_neg_heme"     = "ER negative (Heme)",
+    "ER_neg_specific" = "ER negative (Specific)",
+    "ER_pos_heme"     = "ER positive (Heme)",
+    "ER_pos_specific" = "ER positive (Specific)"
+)
+
+ggplot() +
+    geom_ribbon(
+        data = cohort_ribbon,
+        aes(x = position, ymin = mean_cov - sd_cov, ymax = mean_cov + sd_cov),
+        fill = "grey80", alpha = 0.5
+    ) +
+    geom_line(
+        data = overlay_data |> filter(sample == "Cohort Mean"),
+        aes(x = position, y = mean_coverage),
+        color = "grey40", linewidth = 0.8
+    ) +
+    geom_line(
+        data = overlay_data |> filter(sample != "Cohort Mean"),
+        aes(x = position, y = mean_coverage, color = patnr),
+        linewidth = 0.7
+    ) +
+    facet_wrap(~site_name_clean, scales = "free_y", ncol = 2,
+               labeller = labeller(site_name_clean = site_labels)) +
+    scale_color_manual(values = outlier_patnr_colors, name = "ER- predicted patient") +
+    labs(
+        title = "Coverage profiles of ER- predicted samples vs cohort mean",
+        x     = "Position relative to site center (bp)",
+        y     = "Normalized coverage"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_outlier_profiles.pdf", plot = last_plot(), width = 12, height = 8)
+```
+
+## Logistic regression model
+
+```{r model-coefficients}
+model_coefs |>
+    filter(feature != "intercept") |>
+    mutate(
+        feature_short = gsub("_ER_(neg|pos)_(heme|specific)\\.5e-4_qval", "", feature) |>
+            paste0("\n(", stringr::str_extract(feature, "ER_(neg|pos)_(heme|specific)"), ")"),
+        direction = ifelse(
+            coefficient > 0,
+            "Positive (pushes toward ER+)",
+            "Negative (pushes toward ER-)"
+        )
+    ) |>
+    ggplot(aes(x = reorder(feature_short, coefficient), y = coefficient, fill = direction)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(
+        values = c(
+            "Positive (pushes toward ER+)" = "#E15759",
+            "Negative (pushes toward ER-)" = "#4E79A7"
+        ),
+        name = ""
+    ) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    labs(
+        title = "Logistic regression model coefficients",
+        x     = "",
+        y     = "Coefficient"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_logistic_regression_coefficients.pdf", plot = last_plot(), width = 9, height = 6)
+```
+
+```{r feature-contributions-setup}
+feature_coefs <- model_coefs |> filter(feature != "intercept")
+feature_names <- feature_coefs$feature
+coef_vec      <- feature_coefs$coefficient
+scaler_mean   <- feature_coefs$scaler_mean
+scaler_scale  <- feature_coefs$scaler_scale
+intercept     <- model_coefs |> filter(feature == "intercept") |> pull(coefficient)
+
+raw_features    <- griffin_data |> select(sampleName_shWGS, all_of(feature_names))
+scaled_features <- raw_features |> tibble::column_to_rownames("sampleName_shWGS")
+for (i in seq_along(feature_names)) {
+    scaled_features[[feature_names[i]]] <-
+        (scaled_features[[feature_names[i]]] - scaler_mean[i]) / scaler_scale[i]
+}
+
+contributions <- scaled_features
+for (i in seq_along(feature_names)) {
+    contributions[[feature_names[i]]] <- scaled_features[[feature_names[i]]] * coef_vec[i]
+}
+contributions <- contributions |>
+    tibble::rownames_to_column("sampleName_shWGS") |>
+    mutate(
+        logit_score    = rowSums(across(all_of(feature_names))) + intercept,
+        predicted_prob = 1 / (1 + exp(-logit_score))
+    )
+```
+
+```{r feature-contributions-plot, fig.width=12, fig.height=6}
+outlier_contributions <- contributions |>
+    filter(sampleName_shWGS %in% outlier_samples) |>
+    left_join(griffin_data |> select(sampleName_shWGS, patnr) |> distinct(),
+              by = "sampleName_shWGS") |>
+    tidyr::pivot_longer(
+        cols      = all_of(feature_names),
+        names_to  = "feature",
+        values_to = "contribution"
+    ) |>
+    mutate(
+        feature_short = gsub("_ER_(neg|pos)_(heme|specific)\\.5e-4_qval", "", feature) |>
+            paste0("\n(", stringr::str_extract(feature, "ER_(neg|pos)_(heme|specific)"), ")"),
+        direction = ifelse(contribution > 0, "Toward ER+", "Toward ER-")
+    )
+
+waterfall_data <- outlier_contributions |>
+    group_by(patnr) |>
+    arrange(desc(abs(contribution)), .by_group = TRUE) |>
+    mutate(
+        cumulative   = cumsum(contribution) + intercept,
+        feature_rank = row_number(),
+        start        = lag(cumulative, default = intercept),
+        end          = cumulative
+    ) |>
+    ungroup()
+
+waterfall_data |>
+    mutate(feature_ordered = tidytext::reorder_within(feature_short, -feature_rank, patnr)) |>
+    ggplot(aes(x = feature_ordered)) +
+    geom_segment(
+        aes(xend = feature_ordered, y = start, yend = end, color = direction),
+        linewidth = 3
+    ) +
+    geom_hline(yintercept = 0,         linetype = "dashed", color = "grey40") +
+    geom_hline(yintercept = intercept, linetype = "dotted", color = "grey60") +
+    coord_flip() +
+    facet_wrap(~patnr, scales = "free_y") +
+    tidytext::scale_x_reordered() +
+    scale_color_manual(
+        values = c("Toward ER+" = "#E15759", "Toward ER-" = "#4E79A7"),
+        name   = ""
+    ) +
+    labs(
+        title = "Cumulative feature contributions to logit score (ER- predicted patients)",
+        x     = "",
+        y     = "Cumulative logit score"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_feature_contributions_waterfall.pdf", plot = last_plot(), width = 12, height = 6)
+```
+
+```{r sensitivity-analysis}
+mean_cov_features <- feature_names[grepl("^mean_coverage_", feature_names)]
+coef_vec_reduced  <- coef_vec
+coef_vec_reduced[feature_names %in% mean_cov_features] <- 0
+
+contributions_reduced <- scaled_features
+for (i in seq_along(feature_names)) {
+    contributions_reduced[[feature_names[i]]] <-
+        scaled_features[[feature_names[i]]] * coef_vec_reduced[i]
+}
+contributions_reduced <- contributions_reduced |>
+    tibble::rownames_to_column("sampleName_shWGS") |>
+    mutate(
+        logit_reduced = rowSums(across(all_of(feature_names))) + intercept,
+        prob_reduced  = 1 / (1 + exp(-logit_reduced))
+    )
+
+prediction_comparison <- contributions |>
+    select(sampleName_shWGS, prob_full = predicted_prob) |>
+    left_join(
+        contributions_reduced |> select(sampleName_shWGS, prob_reduced),
+        by = "sampleName_shWGS"
+    ) |>
+    left_join(
+        griffin_data |> select(sampleName_shWGS, timepoint, arm, is_outlier, patnr),
+        by = "sampleName_shWGS"
+    ) |>
+    mutate(
+        pred_full    = ifelse(prob_full    >= 0.5, "ER+", "ER-"),
+        pred_reduced = ifelse(prob_reduced >= 0.5, "ER+", "ER-"),
+        changed      = pred_full != pred_reduced
+    )
+
+prediction_comparison |>
+    ggplot(aes(x = prob_full, y = prob_reduced, color = timepoint, shape = arm)) +
+    geom_point(size = 2.5, alpha = 0.7) +
+    geom_point(
+        data    = prediction_comparison |> filter(is_outlier),
+        color   = "black", size = 4, shape = 1, stroke = 1.2
+    ) +
+    ggrepel::geom_text_repel(
+        data      = prediction_comparison |> filter(is_outlier | changed),
+        aes(label = patnr),
+        color = "black", size = 3
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey50") +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = timepoint_colors, labels = timepoint_labels, name = "Timepoint") +
+    scale_shape_manual(values = c("arm_A" = 16, "arm_B" = 17), labels = arm_labels, name = "Arm") +
+    labs(
+        title = "Sensitivity analysis: full model vs reduced model (no mean coverage features)",
+        x     = "Full model P(ER+)",
+        y     = "Reduced model P(ER+)"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_sensitivity_analysis_full_vs_reduced.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+## GC bias validation
+
+```{r gc-bias-curves}
+gc_bias_mean_per_sample <- gc_bias_relevant |>
+    filter(!is.na(smoothed_GC_bias), smoothed_GC_bias > 0) |>
+    mutate(GC_bin = round(GC_content, 2)) |>
+    group_by(sample, GC_bin, is_outlier) |>
+    summarise(mean_bias_smooth = mean(smoothed_GC_bias, na.rm = TRUE), .groups = "drop")
+
+ggplot() +
+    geom_line(
+        data = gc_bias_mean_per_sample |> filter(!is_outlier),
+        aes(x = GC_bin, y = mean_bias_smooth, group = sample),
+        color = "grey70", alpha = 0.3, linewidth = 0.3
+    ) +
+    geom_line(
+        data = gc_bias_mean_per_sample |> filter(is_outlier),
+        aes(x = GC_bin, y = mean_bias_smooth, color = sample),
+        linewidth = 1
+    ) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+    scale_color_manual(values = outlier_colors, name = "Predicted ER-") +
+    labs(
+        title = "Mean smoothed GC bias per sample (fragment lengths 100-200 bp)",
+        x     = "GC content",
+        y     = "Smoothed GC bias"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_gc_bias_curves.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+```{r gc-bias-magnitude}
+gc_bias_magnitude <- gc_bias_relevant |>
+    filter(!is.na(smoothed_GC_bias), smoothed_GC_bias > 0) |>
+    group_by(sample, is_outlier) |>
+    summarise(
+        mean_abs_deviation = mean(abs(smoothed_GC_bias - 1)),
+        bias_range         = max(smoothed_GC_bias) - min(smoothed_GC_bias),
+        .groups            = "drop"
+    ) |>
+    left_join(
+        griffin_data |> select(sampleName_shWGS, patnr) |> distinct(),
+        by = c("sample" = "sampleName_shWGS")
+    )
+
+gc_bias_magnitude |>
+    ggplot(aes(x = mean_abs_deviation, y = bias_range)) +
+    geom_point(
+        data  = gc_bias_magnitude |> filter(!is_outlier),
+        color = "grey50", size = 2, alpha = 0.6
+    ) +
+    geom_point(
+        data = gc_bias_magnitude |> filter(is_outlier),
+        aes(color = sample), size = 4
+    ) +
+    ggrepel::geom_text_repel(
+        data      = gc_bias_magnitude |> filter(is_outlier),
+        aes(label = patnr, color = sample),
+        size = 3.5
+    ) +
+    scale_color_manual(values = outlier_colors, name = "Predicted ER-") +
+    labs(
+        title    = "GC bias magnitude per sample",
+        subtitle = "ER- predicted outliers fall within the lower half of the cohort",
+        x        = "Mean |bias − 1| (deviation from ideal)",
+        y        = "Bias range (max − min)"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_gc_bias_magnitude.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+```{r uncorrected-vs-corrected, fig.width=12, fig.height=10}
+coverage_both |>
+    filter(sample %in% outlier_samples) |>
+    mutate(site_name_clean = gsub("\\.5e-4_qval", "", site_name)) |>
+    ggplot(aes(x = position, y = coverage, color = correction, linetype = correction)) +
+    geom_line(linewidth = 0.7) +
+    facet_grid(sample ~ site_name_clean, scales = "free_y") +
+    scale_color_manual(
+        values = c("uncorrected" = "#F28E2B", "GC_corrected" = "#4E79A7"),
+        name   = "Correction"
+    ) +
+    scale_linetype_manual(
+        values = c("uncorrected" = "dashed", "GC_corrected" = "solid"),
+        name   = "Correction"
+    ) +
+    labs(
+        title = "Uncorrected vs GC-corrected coverage for ER- predicted samples",
+        x     = "Position relative to site center (bp)",
+        y     = "Normalized coverage"
+    ) +
+    theme_light() +
+    theme(
+        legend.position  = "bottom",
+        legend.direction = "horizontal",
+        text             = element_text(size = 9, family = "Helvetica", face = "bold"),
+        axis.text.x      = element_text(size = 9),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 8),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/fragmentomics_uncorrected_vs_gc_corrected_coverage.pdf", plot = last_plot(), width = 12, height = 10)
+```
+
+
+```{r}
+
+```
+

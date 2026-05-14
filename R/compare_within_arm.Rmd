@@ -1,0 +1,539 @@
+---
+title: "Compare within arm"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r colors-labels}
+arm_colors <- c("arm_A" = "#4E79A7", "arm_B" = "#F28E2B")
+arm_labels <- c("arm_A" = "Combination treatment arm", "arm_B" = "Monotherapy arm")
+
+diff_variant_lables <- c("BL" = "Only baseline", "both" = "Maintained", "PD" = "Only acquired")
+
+focal_copy_number_colors <- c(
+    "acquired_gain" = "#D08159",
+    "stable_gain"   = "#F2A97F",
+    "acquired_loss" = "#8E6BAF",
+    "stable_loss"   = "#C7AEDB"
+)
+
+timepoint_arm_A_colors      <- c("BL" = "#A6C8E0", "PD" = "#4E79A7")
+timepoint_arm_B_colors      <- c("BL" = "#F8C99B", "PD" = "#F28E2B")
+timepoint_labels            <- c("BL" = "Baseline", "PD" = "Progression")
+timepoint_both_arms_colors  <- c("arm_A_BL" = "#A6C8E0", "arm_A_PD" = "#4E79A7",
+                                 "arm_B_BL" = "#F8C99B", "arm_B_PD" = "#F28E2B")
+timepoint_both_arms_labels  <- c("arm_A_BL" = "Baseline (arm A)", "arm_A_PD" = "Progression (arm A)",
+                                 "arm_B_BL" = "Baseline (arm B)", "arm_B_PD" = "Progression (arm B)")
+```
+
+## Somatic mutation burden
+
+```{r mutation-burden}
+somatic_mutation_burden_BL <- somatic_tso500_ALL_trace_variants_paired |>
+    filter(diff_variant == "BL") |>
+    group_by(patnr, arm) |>
+    summarize(n_somatic_mutations = n(), .groups = "drop")
+
+wilcox.test(n_somatic_mutations ~ arm, data = somatic_mutation_burden_BL)
+
+somatic_mutation_burden_BL_both <- somatic_tso500_ALL_trace_variants_paired |>
+    filter(diff_variant %in% c("BL", "both")) |>
+    group_by(patnr, arm) |>
+    summarize(n_somatic_mutations = n(), .groups = "drop")
+
+wilcox.test(n_somatic_mutations ~ arm, data = somatic_mutation_burden_BL_both)
+
+somatic_mutation_burden_PD <- somatic_tso500_ALL_trace_variants_paired |>
+    filter(diff_variant == "PD") |>
+    group_by(patnr, arm) |>
+    summarize(n_somatic_mutations = n(), .groups = "drop")
+
+wilcox.test(n_somatic_mutations ~ arm, data = somatic_mutation_burden_PD)
+```
+
+## McNemar tests — BL vs PD within each arm
+
+```{r mcnemar-function}
+mcnemar_gene <- function(x) {
+    tbl <- matrix(
+        c(x$none, x$BL, x$PD, x$both),
+        nrow = 2, byrow = TRUE
+    )
+    test <- mcnemar.test(tbl)
+    tibble::tibble(
+        p_value    = test$p.value,
+        chi_squared = test$statistic,
+        arm  = x$arm,
+        none = x$none,
+        BL   = x$BL,
+        PD   = x$PD,
+        both = x$both
+    )
+}
+```
+
+```{r contingency-within-arm}
+contingency_within_arm_variant_counts <- somatic_tso500_ALL_trace_variants_paired |>
+    select(patnr, arm, genename, diff_variant) |>
+    distinct() |>
+    group_by(genename, patnr) |>
+    mutate(n = n()) |>
+    ungroup() |>
+    mutate(diff_variant = ifelse(n == 1, diff_variant, "both")) |>
+    select(patnr, arm, genename, diff_variant) |>
+    distinct() |>
+    select(!patnr) |>
+    group_by(arm, genename, diff_variant) |>
+    summarize(n = n(), .groups = "drop") |>
+    tidyr::pivot_wider(names_from = c(diff_variant), values_from = n, values_fill = 0) |>
+    mutate(
+        none = case_when(
+            arm == "arm_A" ~ 21 - (both + BL + PD),
+            arm == "arm_B" ~ 14 - (both + BL + PD)
+        )
+    )
+```
+
+```{r mcnemar-tests}
+arm_A_BL_vs_PD <- contingency_within_arm_variant_counts |>
+    filter(arm == "arm_A") |>
+    group_by(genename) |>
+    group_modify(~mcnemar_gene(.x)) |>
+    ungroup() |>
+    arrange(p_value)
+
+arm_B_BL_vs_PD <- contingency_within_arm_variant_counts |>
+    filter(arm == "arm_B") |>
+    group_by(genename) |>
+    group_modify(~mcnemar_gene(.x)) |>
+    ungroup() |>
+    arrange(p_value)
+```
+
+```{r gene-ordering-oncoprint}
+gene_ordering_oncoprint <- contingency_within_arm_variant_counts |>
+    tidyr::pivot_wider(names_from = arm,
+                       values_from = c(both, BL, PD, none), values_fill = 0) |>
+    mutate(
+        BL           = both_arm_A + both_arm_B + BL_arm_A + BL_arm_B,
+        BL_perc      = BL / {{ n_patients_cohort }},
+        PD           = both_arm_A + both_arm_B + PD_arm_A + PD_arm_B,
+        PD_perc      = PD / {{ n_patients_cohort }},
+        PD_armA      = both_arm_A + PD_arm_A,
+        PD_armA_perc = PD_armA / 21,
+        PD_armB      = both_arm_B + PD_arm_B,
+        PD_armB_perc = PD_armB / 14
+    ) |>
+    arrange(desc(PD_armA_perc)) |>
+    filter(PD_armA_perc > 0.1) |>
+    mutate(gene_ordering = row_number()) |>
+    select(genename, gene_ordering)
+
+arm_A_BL_vs_PD |>
+    right_join(gene_ordering_oncoprint, by = join_by(genename)) |>
+    mutate(p_adj = p.adjust(p_value, method = "fdr"))
+
+arm_B_BL_vs_PD |>
+    right_join(gene_ordering_oncoprint, by = join_by(genename)) |>
+    mutate(p_adj = p.adjust(p_value, method = "fdr"))
+```
+
+## Oncoprints — BL vs PD mutation frequency per arm
+
+```{r oncoprint-arm-a}
+arm_A_BL_vs_PD |>
+    right_join(gene_ordering_oncoprint, by = join_by(genename)) |>
+    mutate(
+        total = none + BL + PD + both,
+        PD    = (PD + both) / total,
+        BL    = (BL + both) / total
+    ) |>
+    tidyr::pivot_longer(cols = c(PD, BL), names_to = "timepoint", values_to = "percentage") |>
+    ggplot(aes(x = reorder(genename, gene_ordering), y = percentage, fill = timepoint)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.5)) +
+    coord_cartesian(ylim = c(0, 1)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_fill_manual(values = timepoint_arm_A_colors) +
+    labs(
+        title = "Baseline and Progression mutations in combination treatment arm",
+        x = "Gene", y = "Percentage of patients with mutation", fill = "Timepoint"
+    ) +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_within_arm_oncoprint_arm_a.pdf", plot = last_plot(), width = 9, height = 5)
+
+```
+
+```{r oncoprint-arm-b}
+arm_B_BL_vs_PD |>
+    right_join(gene_ordering_oncoprint, by = join_by(genename)) |>
+    mutate(
+        total = none + BL + PD + both,
+        PD    = (PD + both) / total,
+        BL    = (BL + both) / total
+    ) |>
+    tidyr::pivot_longer(cols = c(PD, BL), names_to = "timepoint", values_to = "percentage") |>
+    ggplot(aes(x = reorder(genename, gene_ordering), y = percentage, fill = timepoint)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.5)) +
+    coord_cartesian(ylim = c(0, 1)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    scale_fill_manual(values = timepoint_arm_B_colors) +
+    labs(
+        title = "Baseline and Progression mutations in Monotherapy arm",
+        x = "Gene", y = "Percentage of patients with mutation", fill = "Timepoint"
+    ) +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_within_arm_oncoprint_arm_b.pdf", plot = last_plot(), width = 9, height = 5)
+
+```
+
+## Focal copy number — McNemar tests within arm
+
+```{r cn-mcnemar}
+contingency_copy_number_genes <- copy_number_genes |>
+    right_join(gene_ordering_focal_cna, by = join_by(genename)) |>
+    filter(alt == "deletion") |>
+    select(patnr, arm, genename, diff_variant_focal_cna) |>
+    distinct() |>
+    select(!patnr) |>
+    group_by(arm, genename, diff_variant_focal_cna) |>
+    summarize(n = n(), .groups = "drop") |>
+    tidyr::pivot_wider(names_from = c(diff_variant_focal_cna), values_from = n, values_fill = 0) |>
+    mutate(
+        none = case_when(
+            arm == "arm_A" ~ 21 - (both + BL + PD),
+            arm == "arm_B" ~ 14 - (both + BL + PD)
+        )
+    )
+
+contingency_copy_number_genes |>
+    filter(arm == "arm_A") |>
+    group_by(genename) |>
+    group_modify(~mcnemar_gene(.x))
+
+contingency_copy_number_genes |>
+    filter(arm == "arm_B") |>
+    group_by(genename) |>
+    group_modify(~mcnemar_gene(.x))
+```
+
+## Focal CNA bar charts per arm
+
+```{r cn-barchart-arm-a}
+copy_number_genes |>
+    right_join(gene_ordering_focal_cna, by = join_by(genename)) |>
+    group_by(arm, timepoint, genename, gene_ordering, alt) |>
+    summarize(n = n(), .groups = "drop") |>
+    mutate(percentage = ifelse(arm == "arm_A", n / 21, n / 14)) |>
+    filter(arm == "arm_A") |>
+    select(!n) |>
+    tidyr::pivot_wider(names_from = timepoint, values_from = percentage, values_fill = 0) |>
+    tidyr::pivot_longer(cols = c(PD, BL), names_to = "timepoint", values_to = "percentage") |>
+    ggplot(aes(x = reorder(genename, gene_ordering, decreasing = TRUE),
+               y = percentage, fill = timepoint)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.5)) +
+    facet_grid("alt") +
+    coord_cartesian(ylim = c(0, 1)) +
+    scale_fill_manual(values = timepoint_arm_A_colors) +
+    labs(
+        title = "Oncoprint focal CNA's arm A, BL vs PD",
+        x = "Gene", y = "Percentage of patients with focal CNA", fill = "Timepoint"
+    ) +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_within_arm_cn_barchart_arm_a.pdf", plot = last_plot(), width = 9, height = 5)
+
+```
+
+```{r cn-barchart-arm-b}
+copy_number_genes |>
+    right_join(gene_ordering_focal_cna, by = join_by(genename)) |>
+    group_by(arm, timepoint, genename, gene_ordering, alt) |>
+    summarize(n = n(), .groups = "drop") |>
+    mutate(percentage = ifelse(arm == "arm_A", n / 21, n / 14)) |>
+    filter(arm == "arm_B") |>
+    select(!n) |>
+    tidyr::pivot_wider(names_from = timepoint, values_from = percentage, values_fill = 0) |>
+    tidyr::pivot_longer(cols = c(PD, BL), names_to = "timepoint", values_to = "percentage") |>
+    ggplot(aes(x = reorder(genename, gene_ordering, decreasing = TRUE),
+               y = percentage, fill = timepoint)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.5)) +
+    facet_grid("alt") +
+    coord_cartesian(ylim = c(0, 1)) +
+    scale_fill_manual(values = timepoint_arm_B_colors) +
+    labs(
+        title = "Oncoprint focal CNA's arm B, BL vs PD",
+        x = "Gene", y = "Percentage of patients with focal CNA", fill = "Timepoint"
+    ) +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_within_arm_cn_barchart_arm_b.pdf", plot = last_plot(), width = 9, height = 5)
+
+```
+
+## Focal CNA burden
+
+```{r cn-burden}
+focal_copy_number_burden <- copy_number_genes_wide |>
+    filter(!cn_category %in% c("gain_normalized", "loss_normalized")) |>
+    group_by(patnr, arm) |>
+    summarize(n_focal_cn_per_patient = n(), .groups = "drop")
+
+wilcox.test(n_focal_cn_per_patient ~ arm, data = focal_copy_number_burden)
+```
+
+Total focal CNAs per patient (stacked by category):
+```{r cn-total-per-patient}
+copy_number_genes_wide |>
+    filter(!cn_category %in% c("gain_normalized", "loss_normalized")) |>
+    group_by(patnr, arm, cn_category) |>
+    summarize(n = n(), .groups = "drop") |>
+    mutate(n = ifelse(is.na(n), 0, n)) |>
+    right_join(patient_order_somatic_variants, by = join_by(patnr, arm)) |>
+    ggplot(aes(x = reorder(patnr, patient_ordering, decreasing = TRUE), y = n, fill = cn_category)) +
+    geom_bar(stat = "identity") +
+    facet_grid(~arm, scales = "free", space = "free", labeller = labeller(arm = arm_labels)) +
+    scale_fill_manual(
+        values   = focal_copy_number_colors,
+        na.value = "grey80",
+        breaks   = c("acquired_gain", "stable_gain", "acquired_loss", "stable_loss", NA)
+    ) +
+    labs(title = "Total focal CNA's and types", y = "Count", x = "Patient ID", fill = "Alterations") +
+    theme_light() +
+    ggplot2::theme(
+        legend.position  = 'bottom',
+        legend.direction = 'horizontal',
+        text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+        axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+        axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10),
+        axis.title       = element_text(size = 15, face = "bold"),
+        plot.title       = element_text(size = 15, face = "bold")
+    )
+ggsave("results/figures/compare_within_arm_cn_total_per_patient.pdf", plot = last_plot(), width = 10, height = 5)
+```
+
+## Somatic alteration frequency per patient
+
+```{r alteration-frequency-helpers}
+# shared helper: builds "both" category without consequence filter,
+# keeping one row per variant (PD timepoint) with CCF > 3% at both timepoints.
+# the original script never applied protein_coding_consequences to "both" variants.
+build_somatic_both <- function(data) {
+    data |>
+        filter(diff_variant == "both", status == "Somatic") |>
+        group_by(patnr, positionComplete) |>
+        mutate(n = n()) |>
+        filter(timepoint == "PD" | n != 2) |>
+        ungroup() |>
+        select(patnr, sampleName_tso500, timepoint, arm, genename, diff_variant, status,
+               positionComplete, position, proteinchange, varianttype, refcall, altcall,
+               consequence, vaf_BL, vaf_PD, cn_BL, cn_PD, ccf_BL, ccf_PD, depth,
+               tumorFractionEstimate) |>
+        filter(ccf_BL > 0.03 & ccf_PD > 0.03)
+}
+
+# shared columns selected for BL/PD variants
+variant_cols <- c("patnr", "sampleName_tso500", "timepoint", "arm", "genename",
+                  "diff_variant", "status", "positionComplete", "position",
+                  "proteinchange", "varianttype", "refcall", "altcall", "consequence",
+                  "vaf_BL", "vaf_PD", "cn_BL", "cn_PD", "ccf_BL", "ccf_PD", "depth",
+                  "tumorFractionEstimate")
+
+freq_plot <- function(data, title_str) {
+    plot_data <- data |>
+        dplyr::group_by(patnr, arm, diff_variant, varianttype) |>
+        dplyr::summarise(n = dplyr::n(), .groups = "drop")
+
+    totals <- plot_data |>
+        dplyr::group_by(patnr, arm, diff_variant) |>
+        dplyr::summarise(total_n = sum(n), .groups = "drop")
+
+    ggplot(plot_data,
+           aes(x = reorder(patnr, n, decreasing = TRUE), y = n, fill = varianttype)) +
+        geom_bar(stat = "identity") +
+        geom_text(
+            data = totals,
+            aes(x = reorder(patnr, total_n, decreasing = TRUE), y = total_n, label = total_n),
+            inherit.aes = FALSE, vjust = -0.4, size = 4
+        ) +
+        facet_grid(
+            diff_variant ~ arm,
+            scales   = "free",
+            space    = "free",
+            labeller = labeller(arm = arm_labels, diff_variant = diff_variant_lables)
+        ) +
+        coord_cartesian(ylim = c(1, 200)) +
+        labs(title = title_str, x = "Patient ID", y = "n alterations", fill = "") +
+        theme_light() +
+        ggplot2::theme(
+            legend.position  = 'bottom',
+            legend.direction = 'horizontal',
+            text             = ggplot2::element_text(size = 9, family = 'Helvetica', face = 'bold'),
+            axis.text.x      = element_text(angle = 45, hjust = 1, size = 9),
+            axis.title.x     = ggtext::element_textbox_simple(width = NULL, halign = .5),
+            strip.background = element_rect(fill = "lightgray"),
+            strip.text       = element_text(color = "black", size = 10),
+            axis.title       = element_text(size = 15, face = "bold"),
+            plot.title       = element_text(size = 15, face = "bold")
+        )
+
+}
+```
+
+### All variants
+
+```{r alteration-frequency-all}
+somatic_bl_fig1 <- trace_variants_paired |>
+    filter(diff_variant == "BL", status == "Somatic") |>
+    select(all_of(variant_cols))
+
+somatic_pd_fig1 <- trace_variants_paired |>
+    filter(diff_variant == "PD", status == "Somatic") |>
+    select(all_of(variant_cols))
+
+variants_fig1 <- bind_rows(somatic_bl_fig1, somatic_pd_fig1, build_somatic_both(trace_variants_paired)) |>
+    arrange(patnr, genename, positionComplete) |>
+    mutate(mutation_id = paste0(genename, "_", positionComplete))
+
+freq_plot(variants_fig1,
+          "Frequency of somatic alterations, per patient")
+ggsave("results/figures/compare_within_arm_alteration_frequency_all.pdf", plot = last_plot(), width = 10, height = 8)
+```
+
+### All protein-altering variants
+
+```{r alteration-frequency-protein-altering}
+somatic_bl_fig2 <- trace_variants_paired |>
+    filter(diff_variant == "BL", status == "Somatic",
+           consequence %in% protein_coding_consequences) |>
+    select(all_of(variant_cols))
+
+somatic_pd_fig2 <- trace_variants_paired |>
+    filter(diff_variant == "PD", status == "Somatic",
+           consequence %in% protein_coding_consequences) |>
+    select(all_of(variant_cols))
+
+variants_fig2 <- bind_rows(somatic_bl_fig2, somatic_pd_fig2, build_somatic_both(trace_variants_paired)) |>
+    arrange(patnr, genename, positionComplete) |>
+    mutate(mutation_id = paste0(genename, "_", positionComplete))
+
+freq_plot(variants_fig2,
+          "Frequency of somatic protein altering alterations, per patient")
+ggsave("results/figures/compare_within_arm_alteration_frequency_protein_altering.pdf", plot = last_plot(), width = 10, height = 8)
+```
+
+### All protein-altering variants, CCF > 3%
+
+```{r alteration-frequency-ccf-cutoff}
+somatic_bl_fig3 <- trace_variants_paired |>
+    filter(diff_variant == "BL", status == "Somatic",
+           consequence %in% protein_coding_consequences, ccf_BL > 0.03) |>
+    select(all_of(variant_cols))
+
+somatic_pd_fig3 <- trace_variants_paired |>
+    filter(diff_variant == "PD", status == "Somatic",
+           consequence %in% protein_coding_consequences, ccf_PD > 0.03) |>
+    select(all_of(variant_cols))
+
+variants_fig3 <- bind_rows(somatic_bl_fig3, somatic_pd_fig3, build_somatic_both(trace_variants_paired)) |>
+    arrange(patnr, genename, positionComplete) |>
+    mutate(mutation_id = paste0(genename, "_", positionComplete))
+
+freq_plot(variants_fig3,
+          "Frequency of somatic protein altering alterations (CCF>3%), per patient")
+ggsave("results/figures/compare_within_arm_alteration_frequency_ccf_cutoff.pdf", plot = last_plot(), width = 10, height = 8)
+```
+
+## Variant type summary
+
+```{r variant-type-summary}
+variants_fig3 |>
+    dplyr::group_by(varianttype) |>
+    dplyr::summarize(n = dplyr::n(), .groups = "drop")
+```
+
+## Mutation burden — baseline vs progression
+
+```{r mutation-burden-wilcox}
+n_baseline_mutations <- variants_fig3 |>
+    filter(diff_variant %in% c("BL", "both")) |>
+    group_by(patnr, arm) |>
+    summarize(n = n(), .groups = "drop")
+
+wilcox.test(n ~ arm, data = n_baseline_mutations, exact = FALSE)
+
+n_baseline_mutations |>
+    group_by(arm) |>
+    summarize(median_n = median(n), .groups = "drop")
+
+n_progression_mutations <- variants_fig3 |>
+    filter(diff_variant %in% c("PD", "both")) |>
+    group_by(patnr, arm) |>
+    summarize(n = n(), .groups = "drop")
+
+wilcox.test(n ~ arm, data = n_progression_mutations, exact = FALSE)
+
+n_progression_mutations |>
+    group_by(arm) |>
+    summarize(median_n = median(n), .groups = "drop")
+```
+
+```{r}
+
+```
+

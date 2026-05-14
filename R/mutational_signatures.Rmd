@@ -1,0 +1,165 @@
+---
+title: "Mutational signatures"
+output: html_document
+date: "2025-09-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+library(dplyr)
+library(ggplot2)
+```
+
+```{r load-data, include=FALSE}
+source("R/load_and_process_data.R")
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+## Sample preparation
+
+Samples are restricted to those with sufficient somatic SNV burden for reliable
+signature extraction.
+
+```{r selected-samples}
+selected_samples <- c("L10858", "L8790", "L4618", "L8799", "L9684", "L10351")
+
+filtered_variants <- trace_variants_paired |>
+    filter(sampleName_tso500 %in% selected_samples,
+           status      == "Somatic",
+           varianttype == "SNV") |>
+    mutate(sample_id = paste(patnr, timepoint, sep = "_"))
+
+filtered_variants |>
+    group_by(patnr, timepoint) |>
+    summarise(n_somatic_snvs = n(), .groups = "drop") |>
+    arrange(desc(n_somatic_snvs))
+```
+
+```{r build-vcf-list}
+vcf_list <- filtered_variants |>
+    group_by(sample_id) |>
+    group_split() |>
+    lapply(function(df) {
+        gr <- GenomicRanges::GRanges(
+            sample_label = paste0(df$patnr, " (", df$timepoint, ")"),
+            sample_id    = df$sample_id,
+            seqnames     = df$chromosome,
+            ranges       = IRanges::IRanges(start = df$position, width = 1),
+            REF          = df$refcall,
+            ALT          = df$altcall
+        )
+        GenomeInfoDb::genome(gr) <- "hg19"
+        gr
+    })
+
+names(vcf_list) <- vapply(vcf_list, function(gr) unique(gr$sample_label), character(1))
+```
+
+## Mutation matrix and COSMIC signature fitting
+
+```{r mut-matrix}
+mut_mat    <- MutationalPatterns::mut_matrix(vcf_list, ref_genome = "BSgenome.Hsapiens.UCSC.hg19")
+cosmic_sig <- MutationalPatterns::get_known_signatures()
+fit_res    <- MutationalPatterns::fit_to_signatures(mut_mat, cosmic_sig)
+```
+
+## Reconstruction quality
+
+```{r reconstruction-quality}
+cosine_sim            <- MutationalPatterns::cos_sim_matrix(mut_mat, fit_res$reconstructed)
+reconstruction_quality <- diag(cosine_sim)
+
+tibble(
+    sample            = names(reconstruction_quality),
+    cosine_similarity = reconstruction_quality
+) |>
+    ggplot(aes(x = reorder(sample, cosine_similarity), y = cosine_similarity)) +
+    geom_col(fill = "#4E79A7", width = 0.7) +
+    geom_hline(yintercept = 0.9, linetype = "dashed", color = "grey40", linewidth = 0.6) +
+    coord_flip() +
+    scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.02))) +
+    labs(
+        title = "Signature reconstruction quality",
+        x     = NULL,
+        y     = "Cosine similarity"
+    ) +
+    theme_light() +
+    theme(
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        legend.position  = "bottom",
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/mutational_signatures_reconstruction_quality.pdf", plot = last_plot(), width = 7, height = 5)
+```
+
+## Trinucleotide mutation profiles
+
+```{r profile-96}
+MutationalPatterns::plot_96_profile(
+    mut_mat[, c("624 (BL)", "624 (PD)", "874 (BL)", "874 (PD)")],
+    condensed = TRUE
+) +
+    labs(
+        title = "96 trinucleotide mutation profile",
+        y     = "Relative contribution",
+        x     = "Mutation context"
+    ) +
+    theme_light() +
+    theme(
+        plot.title             = element_text(size = 15, face = "bold"),
+        axis.title             = element_text(size = 15, face = "bold"),
+        axis.text.x            = element_text(size = 5, angle = 90, vjust = 0.5),
+        legend.position        = "bottom",
+        strip.background       = element_rect(fill = "lightgray"),
+        strip.text             = element_text(color = "black", size = 10),
+        panel.grid.major.x     = element_blank(),
+        panel.grid.minor.x     = element_blank()
+    )
+ggsave("results/figures/mutational_signatures_trinucleotide_profiles.pdf", plot = last_plot(), width = 9, height = 6)
+```
+
+## Mutational signature contributions
+
+```{r contributions-relative}
+MutationalPatterns::plot_contribution(
+    fit_res$contribution,
+    coord_flip = TRUE,
+    mode       = "relative"
+) +
+    labs(
+        title = "Relative mutational signature contributions",
+        y     = "Relative contribution",
+        x     = "Sample"
+    ) +
+    theme_light() +
+    theme(
+        plot.title       = element_text(size = 15, face = "bold"),
+        axis.title       = element_text(size = 15, face = "bold"),
+        axis.text.x      = element_text(size = 10),
+        strip.background = element_rect(fill = "lightgray"),
+        strip.text       = element_text(color = "black", size = 10)
+    )
+ggsave("results/figures/mutational_signatures_contributions_relative.pdf", plot = last_plot(), width = 9, height = 5)
+```
+
+```{r contributions-table}
+fit_res$contribution |>
+    as.data.frame() |>
+    tibble::rownames_to_column("signature") |>
+    tidyr::pivot_longer(-signature, names_to = "sample", values_to = "contribution") |>
+    group_by(sample) |>
+    mutate(relative_contribution = contribution / sum(contribution)) |>
+    ungroup() |>
+    filter(contribution > 0) |>
+    arrange(sample, desc(relative_contribution))
+```
+
+
+```{r}
+
+```
+

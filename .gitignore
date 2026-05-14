@@ -1,0 +1,11 @@
+# Data files — stored on Zenodo, not in git
+data/
+
+# R artifacts
+*.Rhistory
+*.RData
+*.Rds
+.Rproj.user/
+
+# OS
+.DS_Store
