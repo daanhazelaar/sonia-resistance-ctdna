@@ -1,6 +1,6 @@
 This repository contains all code necessary to reproduce the analyses and figures presented in the manuscript:
 
-**Improved circulating tumor DNA profiling by simultaneous extraction of DNA methylation and copy number information from Methylated DNA Sequencing data (MeD-seq)**
+**High Tumor Fraction ctDNA Analysis Reveals Treatment-Specific Resistance Mechanisms for Aromatase Inhibitor and CDK4/6 Inhibitor in Advanced Breast Cancer**
 
 All data necessary can be found on: https://zenodo.org/records/20185908
 
